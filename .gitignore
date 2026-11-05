@@ -1,0 +1,8 @@
+/target
+/dist
+.DS_Store
+
+# Local agent state, kept out of the source repo
+.beads/
+*.gate.lock*
+.claude/settings.local.json
