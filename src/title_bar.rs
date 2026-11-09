@@ -79,7 +79,7 @@ pub(crate) fn caption_button(
 /// Close fills red; minimise and maximise fill with a light wash.
 fn caption_hover(rect: egui::Rect, kind: CaptionButton) -> (egui::Rect, f32, Color32) {
     let fill = match kind {
-        CaptionButton::Close => Color32::from_rgb(196, 43, 28),
+        CaptionButton::Close if cfg!(target_os = "windows") => Color32::from_rgb(196, 43, 28),
         _ => Color32::from_rgba_unmultiplied(255, 255, 255, 22),
     };
     (rect, 0.0, fill)
@@ -88,7 +88,7 @@ fn caption_hover(rect: egui::Rect, kind: CaptionButton) -> (egui::Rect, f32, Col
 /// While the button is held down: the same shape, a shade deeper.
 fn caption_hover_pressed(rect: egui::Rect, kind: CaptionButton) -> (egui::Rect, f32, Color32) {
     let fill = match kind {
-        CaptionButton::Close => Color32::from_rgb(139, 29, 20),
+        CaptionButton::Close if cfg!(target_os = "windows") => Color32::from_rgb(139, 29, 20),
         _ => Color32::from_rgba_unmultiplied(255, 255, 255, 14),
     };
     (rect, 0.0, fill)
@@ -140,12 +140,49 @@ pub(crate) fn paint_caption_glyph(
     // Windows paints its caption buttons from the system's icon font, and the
     // custom frame puts that region in our hands, so the same glyphs are drawn
     // from the same font. Without the font on the machine, the strokes below.
-    if let Some(galley) = caption_glyph_galley(painter, kind, color) {
-        let pos = rect.center() - galley.rect.center().to_vec2();
-        painter.galley(painter.round_pos_to_pixels(pos), galley, color);
-        return;
+    if cfg!(target_os = "windows") {
+        if let Some(galley) = caption_glyph_galley(painter, kind, color) {
+            let pos = rect.center() - galley.rect.center().to_vec2();
+            painter.galley(painter.round_pos_to_pixels(pos), galley, color);
+            return;
+        }
     }
-    paint_caption_stroke(painter, rect, kind, color);
+    if cfg!(target_os = "linux") {
+        let center = rect.center();
+        let stroke = egui::Stroke::new(1.5_f32, color);
+        match kind {
+            CaptionButton::Minimize => {
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-4.0, 0.0),
+                        center + egui::vec2(4.0, 0.0),
+                    ],
+                    stroke,
+                );
+            }
+            CaptionButton::Maximize | CaptionButton::Restore => {
+                painter.circle_stroke(center, 4.0, stroke);
+            }
+            CaptionButton::Close => {
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-3.5, -3.5),
+                        center + egui::vec2(3.5, 3.5),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-3.5, 3.5),
+                        center + egui::vec2(3.5, -3.5),
+                    ],
+                    stroke,
+                );
+            }
+        }
+    } else {
+        paint_caption_stroke(painter, rect, kind, color);
+    }
 }
 
 /// The caption glyphs drawn by hand: thin 1px Win11-style strokes on a 10x10
@@ -293,6 +330,7 @@ mod tests {
                 assert_eq!(rounding, 0.0, "{kind:?} hover has rounded corners");
             }
         }
+        #[cfg(target_os = "windows")]
         assert_eq!(
             caption_hover(rect, CaptionButton::Close).2,
             Color32::from_rgb(196, 43, 28),

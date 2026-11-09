@@ -386,7 +386,7 @@ impl NotebookApp {
     /// call it directly with an egui context of their own.
     fn draw(&mut self, ctx: &egui::Context) {
         self.collect_finished_sync();
-        if cfg!(target_os = "windows") {
+        if !cfg!(target_os = "macos") {
             self.show_title_bar(ctx);
         }
         self.handle_window_resize(ctx);
@@ -660,7 +660,7 @@ impl NotebookApp {
                     });
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("The token is stored locally in settings.toml.")
+                        egui::RichText::new("The token is stored in your system keyring.")
                             .weak()
                             .small(),
                     );
