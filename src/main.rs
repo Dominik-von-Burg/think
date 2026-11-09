@@ -122,14 +122,20 @@ pub(crate) fn main() {
         return;
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([900.0, 650.0])
+        .with_min_inner_size([400.0, 300.0])
+        .with_icon(app_icon());
+    // Custom chrome (win_chrome + egui title bar) only exists on Windows.
+    // Linux and macOS use native window decorations.
+    if cfg!(target_os = "windows") {
+        viewport = viewport.with_decorations(false);
+    }
+
     if let Err(e) = eframe::run_native(
         APP_NAME,
         NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([900.0, 650.0])
-                .with_min_inner_size([400.0, 300.0])
-                .with_decorations(false)
-                .with_icon(app_icon()),
+            viewport,
             // Keep glyphs sharp. MSAA softens egui's text atlas.
             multisampling: 0,
             ..Default::default()

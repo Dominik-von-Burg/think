@@ -386,7 +386,9 @@ impl NotebookApp {
     /// call it directly with an egui context of their own.
     fn draw(&mut self, ctx: &egui::Context) {
         self.collect_finished_sync();
-        self.show_title_bar(ctx);
+        if cfg!(target_os = "windows") {
+            self.show_title_bar(ctx);
+        }
         self.handle_window_resize(ctx);
 
         egui::CentralPanel::default()
