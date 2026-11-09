@@ -14,9 +14,13 @@ fn main() {
             .compile()
             .expect("could not embed the Windows icon");
         // MinGW only extracts archive members that satisfy a symbol reference.
-        // A resource object has no symbols, so link it directly instead.
-        let resource_object =
-            std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("resource.o");
-        println!("cargo:rustc-link-arg={}", resource_object.display());
+        // A resource object has no symbols, so link it directly instead. The
+        // MSVC toolkit compiles the resource to resource.lib and links it with
+        // a plain `resource` library, and it has no resource.o to name.
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+            let resource_object =
+                std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("resource.o");
+            println!("cargo:rustc-link-arg={}", resource_object.display());
+        }
     }
 }

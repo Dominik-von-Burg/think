@@ -12,6 +12,15 @@ cargo run --release
 
 On Windows, `.\build.ps1` builds `dist\Think.exe`.
 
+## Downloads
+
+GitHub Actions builds both binaries on every push and pull request: `think-linux-x86_64.tar.gz`
+(unpacked binary is `think`) and `think-windows-x86_64.exe`. They are attached to the run under
+[Actions](https://github.com/Dominik-von-Burg/think/actions), and pushing a tag named `v*`
+publishes the same two files on a [release](https://github.com/Dominik-von-Burg/think/releases).
+The Linux binary is built on Ubuntu 22.04 and needs only `libc`, `libm`, `libz` and `libgcc_s`,
+which every current desktop distribution ships.
+
 ## Sync setup
 
 1. Create an empty private GitHub repository.
