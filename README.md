@@ -27,7 +27,17 @@ which every current desktop distribution ships.
 2. Open the gear in the app and enter the repository's HTTPS URL.
 3. Create a fine-grained personal access token with read/write access to the repository's Contents, and paste it in.
 
-The token is stored in plain text in `settings.toml` in the app's data directory (`~/.local/share/think/` on Linux, `%LOCALAPPDATA%\think\` on Windows).
+The token is stored in your OS credential store (Windows Credential Manager, Linux Secret Service / GNOME Keyring). The repository URL is stored in `settings.toml` in the app's data directory (`~/.local/share/think/` on Linux, `%LOCALAPPDATA%\think\` on Windows).
+
+## MCP server
+
+Think can run as a [Model Context Protocol](https://modelcontextprotocol.io/) server so that AI agents can read and edit your notebook:
+
+```sh
+think --mcp
+```
+
+It speaks JSON-RPC over stdio. Point your MCP client (Claude Desktop, Cursor, etc.) at the binary with the `--mcp` argument. The server exposes four tools: `read_notebook`, `write_notebook`, `insert_text`, and `search`.
 
 ## License
 

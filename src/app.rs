@@ -30,13 +30,14 @@ pub(crate) const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub(crate) struct Settings {
     repo_url: String,
-    github_token: String,
 }
 
 pub(crate) struct NotebookApp {
     text: String,
     paths: Paths,
     settings: Settings,
+    /// Token field in the settings dialog. The real token lives in the OS keyring.
+    token_input: String,
     show_settings: bool,
     settings_error: Option<String>,
     dirty_since: Option<Instant>,
@@ -66,10 +67,12 @@ impl NotebookApp {
     }
 
     fn with(paths: Paths, settings: Settings, text: String) -> Self {
+        let token_input = crate::keyring_store::load_token().unwrap_or_default();
         Self {
             text,
             paths,
             settings,
+            token_input,
             show_settings: false,
             settings_error: None,
             dirty_since: None,
@@ -91,21 +94,27 @@ impl NotebookApp {
     fn save_settings(&self) -> Result<(), String> {
         fs::create_dir_all(&self.paths.data_dir).map_err(|e| e.to_string())?;
         let contents = toml::to_string(&self.settings).map_err(|e| e.to_string())?;
-        fs::write(&self.paths.settings, contents).map_err(|e| e.to_string())
+        fs::write(&self.paths.settings, contents).map_err(|e| e.to_string())?;
+        if self.token_input.trim().is_empty() {
+            crate::keyring_store::delete_token().ok();
+        } else {
+            crate::keyring_store::save_token(self.token_input.trim())?;
+        }
+        Ok(())
     }
 
     fn start_sync(&mut self) {
-        if self.settings.repo_url.trim().is_empty()
-            || self.settings.github_token.trim().is_empty()
-            || self.sync_in_progress
-        {
+        let token = match crate::keyring_store::load_token() {
+            Ok(t) if !t.trim().is_empty() => t,
+            _ => return,
+        };
+        if self.settings.repo_url.trim().is_empty() || self.sync_in_progress {
             return;
         }
 
         let notebook = self.paths.notebook.clone();
         let repository = self.paths.repository.clone();
         let repo_url = self.settings.repo_url.clone();
-        let token = self.settings.github_token.clone();
         let (sender, receiver) = mpsc::channel();
         self.sync_in_progress = true;
         self.sync_error = None;
@@ -135,8 +144,8 @@ impl NotebookApp {
     /// Always-visible sync status in the title bar. Covers every state so a
     /// sync that can't happen (not configured) or did fail is never silent.
     fn sync_status(&self, ui: &mut egui::Ui) {
-        let configured = !self.settings.repo_url.trim().is_empty()
-            && !self.settings.github_token.trim().is_empty();
+        let configured =
+            !self.settings.repo_url.trim().is_empty() && crate::keyring_store::has_token();
         if self.sync_in_progress {
             sync_indicator(ui).on_hover_text("Syncing to GitHub…");
         } else if let Some(error) = &self.sync_error {
@@ -612,9 +621,14 @@ impl NotebookApp {
                     ui.add_space(8.0);
                     ui.label("Personal Access Token");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.github_token)
+                        egui::TextEdit::singleline(&mut self.token_input)
                             .password(true)
                             .hint_text("Fine-grained token with Contents read/write"),
+                    );
+                    ui.label(
+                        egui::RichText::new("Stored in your system keyring.")
+                            .weak()
+                            .size(11.0),
                     );
                     if let Some(error) = &self.settings_error {
                         ui.add_space(8.0);
@@ -796,6 +810,7 @@ mod harness {
                 repository: dir.join("repository"),
             },
             settings: Settings::default(),
+            token_input: String::new(),
             show_settings: false,
             settings_error: None,
             dirty_since: None,

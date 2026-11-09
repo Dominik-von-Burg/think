@@ -10,7 +10,9 @@
 
 mod app;
 mod fonts;
+mod keyring_store;
 mod markdown;
+mod mcp;
 mod paths;
 mod scroll;
 mod sync;
@@ -109,8 +111,18 @@ pub(crate) fn app_icon() -> egui::IconData {
     }
 }
 
-pub(crate) fn main() -> eframe::Result<()> {
-    eframe::run_native(
+pub(crate) fn main() {
+    // `--mcp` runs the MCP server on stdio instead of the GUI.
+    if std::env::args().any(|a| a == "--mcp") {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("could not start tokio runtime")
+            .block_on(mcp::run());
+        return;
+    }
+
+    if let Err(e) = eframe::run_native(
         APP_NAME,
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -123,5 +135,8 @@ pub(crate) fn main() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(NotebookApp::new(cc)))),
-    )
+    ) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }

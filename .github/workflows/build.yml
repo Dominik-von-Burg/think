@@ -52,6 +52,10 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      - name: Install system dependencies
+        if: matrix.name == 'linux-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
