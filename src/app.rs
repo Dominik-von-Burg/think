@@ -52,6 +52,10 @@ pub(crate) struct NotebookApp {
     /// The last pass moved the view and asked egui to paint the frame again: trace
     /// the pass that replaces it, which is the one on screen.
     trace_repaint: bool,
+    #[cfg(target_os = "linux")]
+    window_corners: crate::linux_window::WindowCorners,
+    #[cfg(target_os = "linux")]
+    linux_caption: Option<crate::linux_caption::LinuxCaption>,
 }
 
 impl NotebookApp {
@@ -63,10 +67,6 @@ impl NotebookApp {
         let paths = Paths::new();
         let settings = load_settings(&paths.settings);
         let text = fs::read_to_string(&paths.notebook).unwrap_or_default();
-        Self::with(paths, settings, text)
-    }
-
-    fn with(paths: Paths, settings: Settings, text: String) -> Self {
         let token_input = crate::keyring_store::load_token().unwrap_or_default();
         Self {
             text,
@@ -83,6 +83,10 @@ impl NotebookApp {
             fade_top: 0.0,
             fade_bottom: 0.0,
             trace_repaint: false,
+            #[cfg(target_os = "linux")]
+            window_corners: crate::linux_window::WindowCorners::new(cc),
+            #[cfg(target_os = "linux")]
+            linux_caption: crate::linux_caption::LinuxCaption::new(&cc.egui_ctx),
         }
     }
 
@@ -163,11 +167,26 @@ impl NotebookApp {
         }
     }
 
+    fn caption_button(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        kind: CaptionButton,
+    ) -> egui::Response {
+        #[cfg(target_os = "linux")]
+        if let Some(caption) = &self.linux_caption {
+            return caption.button(ui, rect, kind);
+        }
+        caption_button(ui, rect, kind)
+    }
+
     fn show_title_bar(&mut self, ctx: &egui::Context) {
-        // Custom caption with native-style window buttons: 46px wide, flush
-        // with the top-right corner, subtle hover fill (red for close) and
-        // thin 1px glyphs. App controls live left of the buttons.
-        const CAPTION_BUTTON_WIDTH: f32 = 46.0;
+        // The notebook paints under this bar. Only its controls cover the text.
+        const CAPTION_BUTTON_WIDTH: f32 = if cfg!(target_os = "linux") {
+            36.0
+        } else {
+            46.0
+        };
         let screen = ctx.screen_rect();
         egui::Area::new(egui::Id::new("title_bar"))
             .order(egui::Order::Foreground)
@@ -204,14 +223,15 @@ impl NotebookApp {
                 );
 
                 let mut control_hovered = false;
-                let close =
-                    caption_button(ui, close_rect, CaptionButton::Close).on_hover_text("Close");
+                let close = self
+                    .caption_button(ui, close_rect, CaptionButton::Close)
+                    .on_hover_text("Close");
                 control_hovered |= close.hovered();
                 if close.clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
 
-                let maximize = caption_button(
+                let maximize = self.caption_button(
                     ui,
                     max_rect,
                     if maximized {
@@ -231,8 +251,9 @@ impl NotebookApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
 
-                let minimize =
-                    caption_button(ui, min_rect, CaptionButton::Minimize).on_hover_text("Minimize");
+                let minimize = self
+                    .caption_button(ui, min_rect, CaptionButton::Minimize)
+                    .on_hover_text("Minimize");
                 control_hovered |= minimize.hovered();
                 if minimize.clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -778,6 +799,8 @@ impl NotebookApp {
 impl eframe::App for NotebookApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.draw(ctx);
+        #[cfg(target_os = "linux")]
+        self.window_corners.update(ctx);
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
@@ -823,6 +846,10 @@ mod harness {
             fade_top: 0.0,
             fade_bottom: 0.0,
             trace_repaint: false,
+            #[cfg(target_os = "linux")]
+            window_corners: Default::default(),
+            #[cfg(target_os = "linux")]
+            linux_caption: None,
         }
     }
 
