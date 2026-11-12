@@ -79,7 +79,7 @@ pub(crate) fn caption_button(
 /// Close fills red; minimise and maximise fill with a light wash.
 fn caption_hover(rect: egui::Rect, kind: CaptionButton) -> (egui::Rect, f32, Color32) {
     let fill = match kind {
-        CaptionButton::Close if cfg!(target_os = "windows") => Color32::from_rgb(196, 43, 28),
+        CaptionButton::Close => Color32::from_rgb(196, 43, 28),
         _ => Color32::from_rgba_unmultiplied(255, 255, 255, 22),
     };
     (rect, 0.0, fill)
@@ -88,7 +88,7 @@ fn caption_hover(rect: egui::Rect, kind: CaptionButton) -> (egui::Rect, f32, Col
 /// While the button is held down: the same shape, a shade deeper.
 fn caption_hover_pressed(rect: egui::Rect, kind: CaptionButton) -> (egui::Rect, f32, Color32) {
     let fill = match kind {
-        CaptionButton::Close if cfg!(target_os = "windows") => Color32::from_rgb(139, 29, 20),
+        CaptionButton::Close => Color32::from_rgb(139, 29, 20),
         _ => Color32::from_rgba_unmultiplied(255, 255, 255, 14),
     };
     (rect, 0.0, fill)
@@ -330,11 +330,15 @@ mod tests {
                 assert_eq!(rounding, 0.0, "{kind:?} hover has rounded corners");
             }
         }
-        #[cfg(target_os = "windows")]
         assert_eq!(
             caption_hover(rect, CaptionButton::Close).2,
             Color32::from_rgb(196, 43, 28),
             "close must hover red",
+        );
+        assert_eq!(
+            caption_hover_pressed(rect, CaptionButton::Close).2,
+            Color32::from_rgb(139, 29, 20),
+            "close must use a deeper red while pressed",
         );
     }
 }
