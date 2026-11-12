@@ -54,7 +54,10 @@ jobs:
 
       - name: Install system dependencies
         if: matrix.name == 'linux-x86_64'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libgtk-3-0 adwaita-icon-theme xvfb xauth xdotool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev libgtk-3-0 adwaita-icon-theme \
+            libxkbcommon-x11-0 libgl1-mesa-dri libglx-mesa0 xvfb xauth xdotool
 
       - name: Run tests
         run: cargo test --locked --target ${{ matrix.target }}
