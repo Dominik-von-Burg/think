@@ -22,6 +22,8 @@ use crate::trace::scroll_log;
 use crate::{configure_context, set_windows_title_bar_colors, APP_NAME};
 use crate::{mcp, notebook};
 
+mod settings_ui;
+
 #[cfg(target_os = "windows")]
 use crate::win_chrome;
 
@@ -44,15 +46,13 @@ pub(crate) struct NotebookApp {
     mcp_error: Option<String>,
     mcp_edit: Option<McpEdit>,
     settings: Settings,
-    /// Token field in the settings dialog. The real token lives in the OS keyring.
-    token_input: String,
-    show_settings: bool,
-    settings_mcp: bool,
-    settings_error: Option<String>,
+    sync_token: Option<String>,
+    settings_dialog: Option<SettingsDialog>,
     dirty_since: Option<Instant>,
     last_change: Option<Instant>,
     sync_in_progress: bool,
     sync_error: Option<String>,
+    synced: bool,
     sync_receiver: Option<Receiver<Result<(), String>>>,
     /// Painted strength of each fade band, 0.0..=1.0, eased towards the strength
     /// the scroll position calls for so a band never pops in or out.
@@ -65,6 +65,20 @@ pub(crate) struct NotebookApp {
     window_corners: crate::linux_window::WindowCorners,
     #[cfg(target_os = "linux")]
     linux_caption: Option<crate::linux_caption::LinuxCaption>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Sync,
+    Mcp,
+}
+
+struct SettingsDialog {
+    page: SettingsPage,
+    repo_url: String,
+    token: String,
+    saved: bool,
+    error: Option<String>,
 }
 
 struct McpEdit {
@@ -84,7 +98,9 @@ impl NotebookApp {
         let lock = notebook::lock(&paths.data_dir)?;
         let settings = load_settings(&paths.settings);
         let text = notebook::read(&paths.notebook)?;
-        let token_input = crate::keyring_store::load_token().unwrap_or_default();
+        let sync_token = crate::keyring_store::load_token()
+            .ok()
+            .filter(|token| !token.trim().is_empty());
         let mut app = Self {
             text,
             paths,
@@ -93,14 +109,13 @@ impl NotebookApp {
             mcp_error: None,
             mcp_edit: None,
             settings,
-            token_input,
-            show_settings: false,
-            settings_mcp: false,
-            settings_error: None,
+            sync_token,
+            settings_dialog: None,
             dirty_since: None,
             last_change: None,
             sync_in_progress: false,
             sync_error: None,
+            synced: false,
             sync_receiver: None,
             fade_top: 0.0,
             fade_bottom: 0.0,
@@ -142,36 +157,6 @@ impl NotebookApp {
         }
         self.mcp = None;
         Ok(())
-    }
-
-    fn show_mcp_settings(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.label("MCP access");
-        if let Some(server) = &self.mcp {
-            ui.label("An approved client can read and edit this notebook while Think is open.");
-            ui.horizontal(|ui| {
-                if ui.button("Copy URL").clicked() {
-                    ui.ctx().copy_text(mcp::URL.to_owned());
-                }
-                if ui.button("Copy access token").clicked() {
-                    ui.ctx().copy_text(server.token.clone());
-                }
-            });
-            if ui.button("Revoke access").clicked() {
-                self.mcp_error = self.revoke_mcp().err().map(|error| error.to_string());
-            }
-        } else {
-            ui.label("Approve a local MCP client to read and edit this notebook.");
-            if ui.button("Approve MCP client").clicked() {
-                self.mcp_error = self
-                    .approve_mcp(ui.ctx())
-                    .err()
-                    .map(|error| error.to_string());
-            }
-        }
-        if let Some(error) = &self.mcp_error {
-            ui.colored_label(Color32::from_rgb(232, 120, 120), error);
-        }
     }
 
     fn process_mcp(&mut self, ctx: &egui::Context) {
@@ -270,76 +255,134 @@ impl NotebookApp {
         ))
     }
 
-    fn save_settings(&self) -> Result<(), String> {
-        fs::create_dir_all(&self.paths.data_dir).map_err(|e| e.to_string())?;
-        let contents = toml::to_string(&self.settings).map_err(|e| e.to_string())?;
-        fs::write(&self.paths.settings, contents).map_err(|e| e.to_string())?;
-        if self.token_input.trim().is_empty() {
-            crate::keyring_store::delete_token().ok();
-        } else {
-            crate::keyring_store::save_token(self.token_input.trim())?;
+    fn open_settings(&mut self, page: SettingsPage) {
+        let dialog = self.settings_dialog.get_or_insert_with(|| SettingsDialog {
+            page,
+            repo_url: self.settings.repo_url.clone(),
+            token: self.sync_token.clone().unwrap_or_default(),
+            saved: false,
+            error: None,
+        });
+        dialog.page = page;
+    }
+
+    fn save_settings(&mut self, dialog: &SettingsDialog) -> Result<(), String> {
+        let settings = Settings {
+            repo_url: dialog.repo_url.trim().to_owned(),
+        };
+        let token = (!dialog.token.trim().is_empty()).then(|| dialog.token.trim().to_owned());
+        let token_changed = self.sync_token != token;
+        let changed = token_changed || self.settings.repo_url != settings.repo_url;
+        let contents = toml::to_string(&settings).map_err(|error| error.to_string())?;
+        if token_changed {
+            store_sync_token(token.as_deref())?;
+        }
+        if let Err(error) = notebook::save(&self.paths.settings, &contents) {
+            if token_changed {
+                store_sync_token(self.sync_token.as_deref()).map_err(|rollback| {
+                    format!("Could not save settings: {error}. Could not restore the previous keyring entry: {rollback}")
+                })?;
+            }
+            return Err(format!("Could not save settings: {error}"));
+        }
+        self.settings = settings;
+        self.sync_token = token;
+        if changed {
+            self.sync_error = None;
+            self.synced = false;
+            if self.sync_configured() && self.paths.notebook.is_file() {
+                self.last_change = Some(Instant::now());
+            }
         }
         Ok(())
     }
 
+    fn sync_configured(&self) -> bool {
+        !self.settings.repo_url.trim().is_empty() && self.sync_token.is_some()
+    }
+
     fn start_sync(&mut self) {
-        let token = match crate::keyring_store::load_token() {
-            Ok(t) if !t.trim().is_empty() => t,
-            _ => return,
-        };
-        if self.settings.repo_url.trim().is_empty() || self.sync_in_progress {
+        if !self.sync_configured() || self.sync_in_progress {
             return;
         }
-
+        let token = self.sync_token.clone().expect("sync has a token");
         let notebook = self.paths.notebook.clone();
         let repository = self.paths.repository.clone();
         let repo_url = self.settings.repo_url.clone();
         let (sender, receiver) = mpsc::channel();
         self.sync_in_progress = true;
-        self.sync_error = None;
         self.sync_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let _ = sender.send(commit_and_push(&notebook, &repository, &repo_url, &token));
+            let result =
+                commit_and_push(&notebook, &repository, &repo_url, &token).map_err(|message| {
+                    message
+                        .replace(&repo_url, "[repository URL]")
+                        .replace(&token, "[redacted]")
+                });
+            let _ = sender.send(result);
         });
+    }
+
+    fn sync_now(&mut self) {
+        if self.dirty_since.is_some() {
+            if let Err(error) = self.save_notebook() {
+                self.sync_error = Some(format!(
+                    "Could not save the notebook before syncing: {error}"
+                ));
+                return;
+            }
+            self.dirty_since = None;
+        }
+        self.last_change = None;
+        self.start_sync();
     }
 
     fn collect_finished_sync(&mut self) {
         let result = match self.sync_receiver.as_ref() {
             Some(receiver) => match receiver.try_recv() {
                 Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => Err("sync worker stopped".to_owned()),
+                Err(TryRecvError::Disconnected) => {
+                    Err("The sync worker stopped unexpectedly.".to_owned())
+                }
                 Ok(result) => result,
             },
             None => return,
         };
         self.sync_in_progress = false;
         self.sync_receiver = None;
-        if let Err(message) = result {
-            self.sync_error = Some(message);
-        }
+        self.synced = result.is_ok();
+        self.sync_error = result.err();
     }
 
-    /// Always-visible sync status in the title bar. Covers every state so a
-    /// sync that can't happen (not configured) or did fail is never silent.
-    fn sync_status(&self, ui: &mut egui::Ui) {
-        let configured =
-            !self.settings.repo_url.trim().is_empty() && crate::keyring_store::has_token();
-        if self.sync_in_progress {
-            sync_indicator(ui).on_hover_text("Syncing to GitHub…");
-        } else if let Some(error) = &self.sync_error {
-            ui.label(
-                egui::RichText::new("Sync failed")
-                    .color(Color32::from_rgb(232, 120, 120))
-                    .size(12.0),
+    fn sync_status(&mut self, ui: &mut egui::Ui) -> bool {
+        let response = if self.sync_in_progress
+            || (self.sync_configured() && self.last_change.is_some() && self.sync_error.is_none())
+        {
+            return sync_indicator(ui).on_hover_text("Sync pending").hovered();
+        } else if self.sync_error.is_some() {
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new("Sync failed")
+                        .color(Color32::from_rgb(236, 139, 132))
+                        .size(12.0),
+                )
+                .frame(false),
             )
-            .on_hover_text(error.as_str());
-        } else if !configured {
-            ui.label(egui::RichText::new("Not syncing").weak().size(12.0))
-                .on_hover_text("Add a GitHub repository and token in settings to sync your notes.");
-        } else if self.last_change.is_some() {
-            sync_indicator(ui).on_hover_text("Waiting to sync…");
+            .on_hover_text("Open sync details")
+        } else if !self.sync_configured() {
+            ui.add(
+                egui::Button::new(egui::RichText::new("Not syncing").weak().size(12.0))
+                    .frame(false),
+            )
+            .on_hover_text("Open GitHub sync settings")
+        } else {
+            return false;
+        };
+        if response.clicked() {
+            self.open_settings(SettingsPage::Sync);
         }
+        response.hovered()
     }
 
     fn caption_button(
@@ -447,13 +490,13 @@ impl NotebookApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let settings = title_bar_icon_button(ui, TitleBarIcon::Settings)
-                                .on_hover_text("GitHub settings");
+                                .on_hover_text("Settings");
                             control_hovered |= settings.hovered();
                             if settings.clicked() {
-                                self.show_settings = true;
+                                self.open_settings(SettingsPage::Sync);
                             }
 
-                            self.sync_status(ui);
+                            control_hovered |= self.sync_status(ui);
                             if self.mcp_edit.is_some() {
                                 let undo = ui.small_button("Undo MCP edit");
                                 control_hovered |= undo.hovered();
@@ -767,124 +810,7 @@ impl NotebookApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // Centered modal dialog: dimmed backdrop (click outside or Escape to
-        // close), rounded surface, full-width fields.
-        let mut close_settings = false;
-        if self.show_settings {
-            egui::Area::new(egui::Id::new("settings_backdrop"))
-                .order(egui::Order::Middle)
-                .fixed_pos(ctx.screen_rect().min)
-                .show(ctx, |ui| {
-                    let screen = ctx.screen_rect();
-                    ui.painter()
-                        .rect_filled(screen, 0.0, Color32::from_black_alpha(140));
-                    if ui.allocate_rect(screen, egui::Sense::click()).clicked() {
-                        close_settings = true;
-                    }
-                });
-
-            egui::Window::new("Settings")
-                .title_bar(false)
-                .movable(false)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .default_width(440.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(Color32::from_rgb(30, 30, 30))
-                        .stroke(egui::Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                        ))
-                        .rounding(egui::Rounding::same(10.0))
-                        .inner_margin(egui::Margin::same(20.0)),
-                )
-                .show(ctx, |ui| {
-                    // Fixed content width: the window auto-sizes around it.
-                    // (INFINITY-width fields would stretch it full-window.)
-                    ui.set_width(400.0);
-                    if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
-                        close_settings = true;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.settings_mcp, false, "GitHub sync");
-                        ui.selectable_value(&mut self.settings_mcp, true, "MCP access");
-                    });
-                    if self.settings_mcp {
-                        self.show_mcp_settings(ui);
-                        if ui.button("Done").clicked() {
-                            close_settings = true;
-                        }
-                        return;
-                    }
-                    ui.label(
-                        egui::RichText::new("Sync settings")
-                            .size(18.0)
-                            .color(Color32::from_rgb(232, 232, 232)),
-                    );
-                    ui.label(
-                        egui::RichText::new("Push your notebook to a private GitHub repository.")
-                            .weak(),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label("GitHub repository URL");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.repo_url)
-                            .hint_text("https://github.com/you/private-notebook.git"),
-                    );
-                    ui.add_space(8.0);
-                    ui.label("Personal Access Token");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.token_input)
-                            .password(true)
-                            .hint_text("Fine-grained token with Contents read/write"),
-                    );
-                    ui.label(
-                        egui::RichText::new("Stored in your system keyring.")
-                            .weak()
-                            .size(11.0),
-                    );
-                    if let Some(error) = &self.settings_error {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(error.as_str())
-                                .color(Color32::from_rgb(232, 120, 120))
-                                .size(12.0),
-                        );
-                    }
-                    ui.add_space(12.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Save").clicked() {
-                            match self.save_settings() {
-                                Ok(()) => {
-                                    self.settings_error = None;
-                                    close_settings = true;
-                                }
-                                Err(error) => {
-                                    self.settings_error = Some(error);
-                                }
-                            }
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.settings_error = None;
-                            close_settings = true;
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("The token is stored in your system keyring.")
-                            .weak()
-                            .small(),
-                    );
-                });
-
-            if close_settings {
-                self.show_settings = false;
-            }
-        }
+        self.draw_settings(ctx);
 
         // Arrow over the title bar: the editor's I-beam must not leak through
         // the floating header. Resize cursors still win on the border.
@@ -1028,6 +954,14 @@ impl eframe::App for NotebookApp {
     }
 }
 
+fn store_sync_token(token: Option<&str>) -> Result<(), String> {
+    match token {
+        Some(token) => crate::keyring_store::save_token(token),
+        None => crate::keyring_store::delete_token(),
+    }
+    .map_err(|error| format!("Could not update the system keyring: {error}"))
+}
+
 pub(crate) fn load_settings(path: &Path) -> Settings {
     fs::read_to_string(path)
         .ok()
@@ -1084,14 +1018,13 @@ mod harness {
                 repository: dir.join("repository"),
             },
             settings: Settings::default(),
-            token_input: String::new(),
-            show_settings: false,
-            settings_mcp: false,
-            settings_error: None,
+            sync_token: None,
+            settings_dialog: None,
             dirty_since: None,
             last_change: None,
             sync_in_progress: false,
             sync_error: None,
+            synced: false,
             sync_receiver: None,
             fade_top: 0.0,
             fade_bottom: 0.0,
@@ -1438,6 +1371,32 @@ mod tests {
     use super::*;
     use egui::Key;
     use harness::{report, Notebook};
+
+    #[test]
+    fn sync_settings_paints_the_failure_reason_without_hovering() {
+        let mut nb = Notebook::open("note", 650.0, 1.0);
+        let error = "Could not push to GitHub: connection timed out";
+        nb.app.sync_error = Some(error.to_owned());
+        nb.app.open_settings(SettingsPage::Sync);
+        for _ in 0..4 {
+            let output = nb.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 650.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| nb.app.draw_settings(ctx),
+            );
+            if output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text == error)
+            }) {
+                return;
+            }
+        }
+        panic!("The open sync settings did not paint the failure reason");
+    }
 
     #[test]
     fn mcp_highlight_fades_after_idle_and_undo_still_restores_the_note() {

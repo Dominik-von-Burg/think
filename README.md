@@ -43,6 +43,8 @@ which every current desktop distribution ships.
 
 The token is stored in your OS credential store (Windows Credential Manager, Linux Secret Service / GNOME Keyring). The repository URL is stored in `settings.toml` in the app's data directory (`~/.local/share/think/` on Linux, `%LOCALAPPDATA%\think\` on Windows).
 
+If a sync fails, click **Sync failed** in the title bar to see the reason. Use **Copy details** to copy the error or **Retry sync** to try again without editing the notebook.
+
 ## MCP server
 
 Think serves [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) while the desktop app is open. It is off until you open the gear, select **MCP access**, and click **Approve MCP client**.
