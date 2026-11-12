@@ -1,187 +1,231 @@
-//! MCP server: exposes the notebook to AI agents over stdio.
-//!
-//! Run with `think --mcp`. The agent launches this as a subprocess and speaks
-//! JSON-RPC 2.0 over stdin/stdout. No network, no auth — the OS process
-//! boundary is the security boundary.
+//! The desktop app's opt-in Streamable HTTP MCP endpoint.
 
-use std::fs;
-use std::path::PathBuf;
+use std::{io, net::TcpListener, ops::Range, thread::JoinHandle};
 
+use axum::{
+    extract::Request,
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    Router,
+};
 use rmcp::{
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
-    schemars, tool, tool_router,
-    transport::stdio,
-    ErrorData, ServerHandler, ServiceExt,
+    schemars,
+    serde_json::json,
+    tool, tool_router,
+    transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    },
+    ErrorData, ServerHandler,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use tokio::{
+    runtime::Builder,
+    sync::{mpsc, oneshot},
+};
 
-use crate::paths::Paths;
+const ADDRESS: &str = "127.0.0.1:8374";
+pub(crate) const URL: &str = "http://127.0.0.1:8374/mcp";
+pub(crate) const TOKEN_FILE: &str = "mcp-token";
 
-/// The MCP server state. Holds the notebook path so tools can read/write it.
+pub(crate) struct McpServer {
+    pub(crate) token: String,
+    pub(crate) requests: mpsc::Receiver<NotebookRequest>,
+    stop: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl McpServer {
+    pub(crate) fn start(ctx: egui::Context, token: String) -> io::Result<Self> {
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid MCP access token",
+            ));
+        }
+        let listener = TcpListener::bind(ADDRESS)?;
+        listener.set_nonblocking(true)?;
+        let runtime = Builder::new_current_thread().enable_all().build()?;
+        let (sender, requests) = mpsc::channel(32);
+        let router = router(sender, ctx, &token);
+        // A current-thread runtime needs a thread driving it while egui runs.
+        let listener = {
+            let _guard = runtime.enter();
+            tokio::net::TcpListener::from_std(listener)?
+        };
+        let (stop, stopped) = oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("think-mcp".to_owned())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::select! {
+                        _ = axum::serve(listener, router) => {}
+                        _ = stopped => {}
+                    }
+                });
+            })?;
+        Ok(Self {
+            token,
+            requests,
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        self.requests.close();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(crate) fn new_token() -> io::Result<String> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    Ok(hex(&bytes))
+}
+
+fn router(sender: mpsc::Sender<NotebookRequest>, ctx: egui::Context, token: &str) -> Router {
+    let expected = format!("Bearer {token}");
+    let config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts([ADDRESS, "localhost:8374"])
+        .enforce_origin_validation();
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(ThinkMcp {
+                sender: sender.clone(),
+                ctx: ctx.clone(),
+            })
+        },
+        Default::default(),
+        config,
+    );
+    let service: StreamableHttpService<ThinkMcp, LocalSessionManager> = service;
+    Router::new()
+        .route_service("/mcp", service)
+        .layer(middleware::from_fn(move |request, next| {
+            authorize(request, next, expected.clone())
+        }))
+}
+
+async fn authorize(request: Request, next: Next, expected: String) -> Response {
+    if request.headers().contains_key(header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let approved = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())));
+    if !approved {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[derive(Clone)]
-pub struct ThinkMcp {
-    #[allow(dead_code)] // used by the tool_router macro
-    tool_router: ToolRouter<ThinkMcp>,
-    notebook: PathBuf,
+struct ThinkMcp {
+    sender: mpsc::Sender<NotebookRequest>,
+    ctx: egui::Context,
 }
-
-impl ThinkMcp {
-    pub fn new() -> Self {
-        let paths = Paths::new();
-        Self {
-            tool_router: Self::tool_router(),
-            notebook: paths.notebook,
-        }
-    }
-
-    /// For tests: use a custom notebook path.
-    #[cfg(test)]
-    pub fn with_notebook(notebook: PathBuf) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            notebook,
-        }
-    }
-}
-
-// ─── Tool parameters ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(description = "Parameters for writing to the notebook")]
 struct WriteParams {
     #[schemars(description = "The full text to write to the notebook")]
     text: String,
+    #[schemars(description = "The revision returned by read_notebook or search")]
+    expected_revision: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(description = "Parameters for inserting text at a position")]
 struct InsertParams {
     #[schemars(
-        description = "The 1-based line number after which to insert. 0 inserts at the beginning."
+        description = "The 1-based line after which to insert. 0 inserts at the beginning."
     )]
     line: usize,
-    #[schemars(description = "The text to insert. It becomes its own line(s).")]
     text: String,
+    #[schemars(description = "The revision returned by read_notebook or search")]
+    expected_revision: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(description = "Parameters for searching the notebook")]
 struct SearchParams {
-    #[schemars(description = "The string to search for (case-insensitive)")]
     query: String,
 }
-
-// ─── Tools ─────────────────────────────────────────────────────────────────────
 
 #[tool_router]
 impl ThinkMcp {
     #[tool(
         name = "read_notebook",
-        description = "Read the full text of the notebook."
+        description = "Read the live notebook and its revision."
     )]
     async fn read_notebook(&self) -> Result<CallToolResult, ErrorData> {
-        let text = fs::read_to_string(&self.notebook).map_err(|e| {
-            ErrorData::internal_error(format!("could not read notebook: {e}"), None)
-        })?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        Ok(self.request(Command::Read).await)
     }
 
     #[tool(
         name = "write_notebook",
-        description = "Replace the full text of the notebook with the given content."
+        description = "Replace the live notebook if the expected revision still matches. Read it again if it changed."
     )]
     async fn write_notebook(
         &self,
         Parameters(params): Parameters<WriteParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        fs::create_dir_all(
-            self.notebook
-                .parent()
-                .ok_or_else(|| ErrorData::internal_error("no parent dir", None))?,
-        )
-        .map_err(|e| ErrorData::internal_error(format!("could not create directory: {e}"), None))?;
-        fs::write(&self.notebook, &params.text).map_err(|e| {
-            ErrorData::internal_error(format!("could not write notebook: {e}"), None)
-        })?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Wrote {} bytes to the notebook.",
-            params.text.len()
-        ))]))
+        Ok(self.request(Command::Write(params)).await)
     }
 
     #[tool(
         name = "insert_text",
-        description = "Insert text at a given line number. Line 0 inserts at the beginning."
+        description = "Insert lines after the given line if the expected revision still matches. Read again if the notebook changed."
     )]
     async fn insert_text(
         &self,
         Parameters(params): Parameters<InsertParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let existing = fs::read_to_string(&self.notebook).unwrap_or_default();
-        let mut lines: Vec<String> = existing.lines().map(String::from).collect();
-
-        if params.line == 0 {
-            // Insert at the beginning
-            for l in params.text.lines().rev() {
-                lines.insert(0, l.to_owned());
-            }
-        } else if params.line >= lines.len() {
-            // Append at the end
-            for l in params.text.lines() {
-                lines.push(l.to_owned());
-            }
-        } else {
-            // Insert after the given line (1-based)
-            let idx = params.line;
-            for (i, l) in params.text.lines().enumerate() {
-                lines.insert(idx + i, l.to_owned());
-            }
-        }
-
-        let new_text = lines.join("\n");
-        if !new_text.is_empty() {
-            let new_text = format!("{new_text}\n");
-            fs::write(&self.notebook, new_text).map_err(|e| {
-                ErrorData::internal_error(format!("could not write notebook: {e}"), None)
-            })?;
-        }
-
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Inserted {} line(s) at position {}.",
-            params.text.lines().count(),
-            params.line
-        ))]))
+        Ok(self.request(Command::Insert(params)).await)
     }
 
     #[tool(
         name = "search",
-        description = "Search the notebook for a string (case-insensitive). Returns matching lines with their line numbers."
+        description = "Find case-insensitive matching lines in the live notebook and return its revision."
     )]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let text = fs::read_to_string(&self.notebook).map_err(|e| {
-            ErrorData::internal_error(format!("could not read notebook: {e}"), None)
-        })?;
-        let query = params.query.to_lowercase();
-        let matches: Vec<String> = text
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.to_lowercase().contains(&query))
-            .map(|(i, line)| format!("{}: {line}", i + 1))
-            .collect();
+        Ok(self.request(Command::Search(params.query)).await)
+    }
+}
 
-        if matches.is_empty() {
-            Ok(CallToolResult::success(vec![ContentBlock::text(
-                "No matches found.",
-            )]))
-        } else {
-            Ok(CallToolResult::success(vec![ContentBlock::text(
-                matches.join("\n"),
-            )]))
+impl ThinkMcp {
+    async fn request(&self, command: Command) -> CallToolResult {
+        let (reply, result) = oneshot::channel();
+        if self
+            .sender
+            .try_send(NotebookRequest { command, reply })
+            .is_err()
+        {
+            return tool_error(
+                "Think is busy or MCP access was revoked. Read again before retrying.",
+            );
         }
+        self.ctx.request_repaint();
+        result
+            .await
+            .unwrap_or_else(|_| tool_error("Think closed or MCP access was revoked."))
     }
 }
 
@@ -195,185 +239,208 @@ impl ServerHandler for ThinkMcp {
     }
 }
 
-/// Run the MCP server on stdio. Blocks until the client disconnects.
-pub async fn run() {
-    let server = ThinkMcp::new();
-    let running = match server.serve(stdio()).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("MCP server initialization failed: {e}");
-            return;
-        }
-    };
-    let _ = running.waiting().await;
+enum Command {
+    Read,
+    Search(String),
+    Write(WriteParams),
+    Insert(InsertParams),
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────────
+pub(crate) struct NotebookRequest {
+    command: Command,
+    pub(crate) reply: oneshot::Sender<CallToolResult>,
+}
+
+pub(crate) struct Edit {
+    pub(crate) text: String,
+    pub(crate) inserted: Option<Range<usize>>,
+}
+
+impl NotebookRequest {
+    pub(crate) fn run(
+        &self,
+        current: &str,
+        save: impl FnOnce(&str) -> io::Result<()>,
+    ) -> (CallToolResult, Option<Edit>) {
+        self.command.run(current, save)
+    }
+}
+
+impl Command {
+    fn run(
+        &self,
+        current: &str,
+        save: impl FnOnce(&str) -> io::Result<()>,
+    ) -> (CallToolResult, Option<Edit>) {
+        let current_revision = revision(current);
+        let (expected, edit, message) = match self {
+            Self::Read => return (result(current.to_owned(), &current_revision), None),
+            Self::Search(query) => {
+                let query = query.to_lowercase();
+                let matches = current
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.to_lowercase().contains(&query))
+                    .map(|(i, line)| format!("{}: {line}", i + 1))
+                    .collect::<Vec<_>>();
+                let text = if matches.is_empty() {
+                    "No matches found.".to_owned()
+                } else {
+                    matches.join("\n")
+                };
+                return (result(text, &current_revision), None);
+            }
+            Self::Write(params) => (
+                &params.expected_revision,
+                Some(Edit {
+                    text: params.text.clone(),
+                    inserted: None,
+                }),
+                format!("Wrote {} bytes to the notebook.", params.text.len()),
+            ),
+            Self::Insert(params) => (
+                &params.expected_revision,
+                insert(current, params.line, &params.text),
+                format!("Inserted {} line(s).", params.text.lines().count()),
+            ),
+        };
+        if *expected != current_revision {
+            return (
+                tool_error("Notebook changed. Read it again before retrying your edit."),
+                None,
+            );
+        }
+        let Some(edit) = edit.filter(|edit| edit.text != current) else {
+            return (
+                result("Notebook is unchanged.".to_owned(), &current_revision),
+                None,
+            );
+        };
+        if let Err(error) = save(&edit.text) {
+            return (
+                tool_error(format!("Could not save notebook: {error}")),
+                None,
+            );
+        }
+        (result(message, &revision(&edit.text)), Some(edit))
+    }
+}
+
+fn revision(text: &str) -> String {
+    hex(Sha256::digest(text.as_bytes()).as_slice())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 15)]));
+    }
+    output
+}
+
+fn result(text: String, revision: &str) -> CallToolResult {
+    let mut result = CallToolResult::success(vec![
+        ContentBlock::text(text.clone()),
+        ContentBlock::text(format!("Notebook revision: {revision}")),
+    ]);
+    result.structured_content = Some(json!({ "text": text, "revision": revision }));
+    result
+}
+
+fn tool_error(message: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(message.into())])
+}
+
+fn insert(current: &str, line: usize, text: &str) -> Option<Edit> {
+    if text.is_empty() {
+        return None;
+    }
+    let offset = current.split_inclusive('\n').take(line).map(str::len).sum();
+    let (before, after) = current.split_at(offset);
+    let newline = match current.split_once('\n') {
+        Some((first_line, _)) if first_line.ends_with('\r') => "\r\n",
+        _ => "\n",
+    };
+    let mut updated = before.to_owned();
+    if !before.is_empty() && !before.ends_with('\n') {
+        updated.push_str(newline);
+    }
+    let start = updated.len();
+    for line in text.lines() {
+        updated.push_str(line);
+        updated.push_str(newline);
+    }
+    let end = updated.len();
+    updated.push_str(after);
+    Some(Edit {
+        text: updated,
+        inserted: Some(start..end),
+    })
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    fn test_server(content: &str) -> (ThinkMcp, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let notebook = dir.path().join("notebook.txt");
-        fs::write(&notebook, content).unwrap();
-        (ThinkMcp::with_notebook(notebook), dir)
-    }
-
-    fn tool_text(result: CallToolResult) -> String {
-        result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap_or_default()
-    }
-
-    #[tokio::test]
-    async fn read_notebook_returns_content() {
-        let (server, _dir) = test_server("hello world\nsecond line\n");
-        let result = server.read_notebook().await.unwrap();
-        assert_eq!(tool_text(result), "hello world\nsecond line\n");
-    }
-
-    #[tokio::test]
-    async fn read_notebook_empty_file() {
-        let (server, _dir) = test_server("");
-        let result = server.read_notebook().await.unwrap();
-        assert_eq!(tool_text(result), "");
-    }
-
-    #[tokio::test]
-    async fn read_notebook_missing_file_is_error() {
-        let dir = TempDir::new().unwrap();
-        let server = ThinkMcp::with_notebook(dir.path().join("nonexistent.txt"));
-        let result = server.read_notebook().await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn write_notebook_replaces_content() {
-        let (server, _dir) = test_server("old content");
-        let params = WriteParams {
-            text: "new content\n".to_owned(),
-        };
-        let result = server.write_notebook(Parameters(params)).await.unwrap();
-        assert!(tool_text(result).contains("Wrote"));
-
-        let on_disk = fs::read_to_string(server.notebook).unwrap();
-        assert_eq!(on_disk, "new content\n");
-    }
-
-    #[tokio::test]
-    async fn write_notebook_creates_parent_dir() {
-        let dir = TempDir::new().unwrap();
-        let notebook = dir.path().join("sub/dir/notebook.txt");
-        let server = ThinkMcp::with_notebook(notebook.clone());
-        let params = WriteParams {
-            text: "created".to_owned(),
-        };
-        server.write_notebook(Parameters(params)).await.unwrap();
-        assert_eq!(fs::read_to_string(notebook).unwrap(), "created");
-    }
-
-    #[tokio::test]
-    async fn insert_text_at_beginning() {
-        let (server, _dir) = test_server("line2\nline3\n");
-        let params = InsertParams {
-            line: 0,
-            text: "line1".to_owned(),
-        };
-        server.insert_text(Parameters(params)).await.unwrap();
-        let on_disk = fs::read_to_string(server.notebook).unwrap();
-        assert_eq!(on_disk, "line1\nline2\nline3\n");
-    }
-
-    #[tokio::test]
-    async fn insert_text_in_middle() {
-        let (server, _dir) = test_server("a\nb\nc\n");
-        let params = InsertParams {
-            line: 1,
-            text: "x\ny".to_owned(),
-        };
-        server.insert_text(Parameters(params)).await.unwrap();
-        let on_disk = fs::read_to_string(server.notebook).unwrap();
-        assert_eq!(on_disk, "a\nx\ny\nb\nc\n");
-    }
-
-    #[tokio::test]
-    async fn insert_text_at_end() {
-        let (server, _dir) = test_server("a\nb\n");
-        let params = InsertParams {
-            line: 99,
-            text: "c".to_owned(),
-        };
-        server.insert_text(Parameters(params)).await.unwrap();
-        let on_disk = fs::read_to_string(server.notebook).unwrap();
-        assert_eq!(on_disk, "a\nb\nc\n");
-    }
-
-    #[tokio::test]
-    async fn insert_text_into_empty_file() {
-        let (server, _dir) = test_server("");
-        let params = InsertParams {
-            line: 0,
-            text: "first".to_owned(),
-        };
-        server.insert_text(Parameters(params)).await.unwrap();
-        let on_disk = fs::read_to_string(server.notebook).unwrap();
-        assert_eq!(on_disk, "first\n");
-    }
-
-    #[tokio::test]
-    async fn search_finds_matches() {
-        let (server, _dir) = test_server("Hello World\nhello there\nGOODBYE\n");
-        let params = SearchParams {
-            query: "hello".to_owned(),
-        };
-        let result = server.search(Parameters(params)).await.unwrap();
-        let text = tool_text(result);
-        assert!(text.contains("1: Hello World"));
-        assert!(text.contains("2: hello there"));
-        assert!(!text.contains("GOODBYE"));
-    }
-
-    #[tokio::test]
-    async fn search_case_insensitive() {
-        let (server, _dir) = test_server("Rust is great\n");
-        let params = SearchParams {
-            query: "rust".to_owned(),
-        };
-        let result = server.search(Parameters(params)).await.unwrap();
-        assert!(tool_text(result).contains("1: Rust is great"));
-    }
-
-    #[tokio::test]
-    async fn search_no_matches() {
-        let (server, _dir) = test_server("nothing here\n");
-        let params = SearchParams {
-            query: "zzz".to_owned(),
-        };
-        let result = server.search(Parameters(params)).await.unwrap();
-        assert_eq!(tool_text(result), "No matches found.");
-    }
-
-    #[tokio::test]
-    async fn search_empty_notebook() {
-        let (server, _dir) = test_server("");
-        let params = SearchParams {
-            query: "anything".to_owned(),
-        };
-        let result = server.search(Parameters(params)).await.unwrap();
-        assert_eq!(tool_text(result), "No matches found.");
+    #[test]
+    fn read_and_search_share_the_revision_of_live_text() {
+        let current = "Hello world\nhello again\nGoodbye";
+        let (read, _) = Command::Read.run(current, |_| unreachable!());
+        let (search, _) = Command::Search("HELLO".into()).run(current, |_| unreachable!());
+        let read = read.structured_content.unwrap();
+        let search = search.structured_content.unwrap();
+        assert_eq!(read["text"], current);
+        assert_eq!(search["text"], "1: Hello world\n2: hello again");
+        assert_eq!(read["revision"], search["revision"]);
     }
 
     #[test]
-    fn server_info_has_correct_name() {
-        let dir = TempDir::new().unwrap();
-        let server = ThinkMcp::with_notebook(dir.path().join("n.txt"));
-        let info = server.get_info();
-        assert_eq!(info.server_info.name, "think");
+    fn stale_insert_and_replace_cannot_overwrite_live_typing() {
+        let expected_revision = revision("Before typing");
+        for command in [
+            Command::Insert(InsertParams {
+                line: 1,
+                text: "AI".into(),
+                expected_revision: expected_revision.clone(),
+            }),
+            Command::Write(WriteParams {
+                text: "AI replacement".into(),
+                expected_revision,
+            }),
+        ] {
+            let (result, edit) = command.run("Before typing\nNew human text", |_| {
+                panic!("stale request must not save")
+            });
+            assert_eq!(result.is_error, Some(true));
+            assert!(edit.is_none());
+        }
+    }
+
+    #[test]
+    fn inserts_keep_existing_line_endings_and_report_utf8_byte_ranges() {
+        for (current, line, input, expected, highlighted) in [
+            ("", 0, "first", "first\n", "first\n"),
+            ("a\r\nb", 1, "é\nz", "a\r\né\r\nz\r\nb", "é\r\nz\r\n"),
+            ("a", 99, "b", "a\nb\n", "b\n"),
+            ("b\n", 0, "a", "a\nb\n", "a\n"),
+        ] {
+            let edit = insert(current, line, input).unwrap();
+            assert_eq!(edit.text, expected);
+            assert_eq!(&edit.text[edit.inserted.unwrap()], highlighted);
+        }
+        assert!(insert("a", 0, "").is_none());
+    }
+
+    #[test]
+    fn failed_save_leaves_the_editor_untouched() {
+        let command = Command::Write(WriteParams {
+            text: "new".into(),
+            expected_revision: revision("old"),
+        });
+        let (result, edit) = command.run("old", |_| Err(io::Error::other("disk failure")));
+        assert_eq!(result.is_error, Some(true));
+        assert!(edit.is_none());
     }
 }

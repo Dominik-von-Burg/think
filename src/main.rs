@@ -17,6 +17,7 @@ mod linux_caption;
 mod linux_window;
 mod markdown;
 mod mcp;
+mod notebook;
 mod paths;
 mod scroll;
 mod sync;
@@ -116,14 +117,9 @@ pub(crate) fn app_icon() -> egui::IconData {
 }
 
 pub(crate) fn main() {
-    // `--mcp` runs the MCP server on stdio instead of the GUI.
-    if std::env::args().any(|a| a == "--mcp") {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("could not start tokio runtime")
-            .block_on(mcp::run());
-        return;
+    if std::env::args().any(|arg| arg == "--mcp") {
+        eprintln!("MCP now runs over HTTP. Open Think and approve access in Settings.");
+        std::process::exit(2);
     }
 
     let viewport = egui::ViewportBuilder::default()
@@ -141,7 +137,7 @@ pub(crate) fn main() {
             multisampling: 0,
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(NotebookApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(NotebookApp::new(cc)?))),
     ) {
         eprintln!("{e}");
         std::process::exit(1);

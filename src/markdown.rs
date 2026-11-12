@@ -1,7 +1,7 @@
 //! Markdown in a plain-text document: headers sized by the layouter, links found
 //! in the text.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use eframe::egui::{
     self,
@@ -9,7 +9,12 @@ use eframe::egui::{
     Color32, FontId,
 };
 
-pub(crate) fn markdown_layouter(ui: &egui::Ui, text: &str, wrap_width: f32) -> Arc<egui::Galley> {
+pub(crate) fn markdown_layouter(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+    highlight: Option<&(Range<usize>, Color32)>,
+) -> Arc<egui::Galley> {
     let font_id = FontId::monospace(14.0);
     let regular = ui.visuals().widgets.inactive.text_color();
     let header_blue = Color32::from_rgb(140, 180, 232);
@@ -68,6 +73,30 @@ pub(crate) fn markdown_layouter(ui: &egui::Ui, text: &str, wrap_width: f32) -> A
     }
     push(&mut job, &text[run_start..], run_header);
 
+    if let Some((range, color)) = highlight {
+        for section in std::mem::take(&mut job.sections) {
+            let start = section.byte_range.start.max(range.start);
+            let end = section.byte_range.end.min(range.end);
+            if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                job.sections.push(section);
+                continue;
+            }
+            if section.byte_range.start < start {
+                let mut before = section.clone();
+                before.byte_range.end = start;
+                job.sections.push(before);
+            }
+            let mut marked = section.clone();
+            marked.byte_range = start..end;
+            marked.format.background = *color;
+            job.sections.push(marked);
+            if end < section.byte_range.end {
+                let mut after = section;
+                after.byte_range.start = end;
+                job.sections.push(after);
+            }
+        }
+    }
     ui.fonts(|f| f.layout_job(job))
 }
 

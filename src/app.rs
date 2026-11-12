@@ -1,7 +1,8 @@
 //! The notebook's state and the frame it paints.
 
 use std::{
-    fs,
+    fs, io,
+    ops::Range,
     path::Path,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -19,6 +20,7 @@ use crate::sync::commit_and_push;
 use crate::title_bar::*;
 use crate::trace::scroll_log;
 use crate::{configure_context, set_windows_title_bar_colors, APP_NAME};
+use crate::{mcp, notebook};
 
 #[cfg(target_os = "windows")]
 use crate::win_chrome;
@@ -26,6 +28,8 @@ use crate::win_chrome;
 pub(crate) const DEBOUNCE: Duration = Duration::from_secs(3);
 
 pub(crate) const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+const MCP_HIGHLIGHT_SECONDS: f64 = 5.0;
+const MCP_HIGHLIGHT_FADE_SECONDS: f64 = 0.4;
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub(crate) struct Settings {
@@ -35,10 +39,15 @@ pub(crate) struct Settings {
 pub(crate) struct NotebookApp {
     text: String,
     paths: Paths,
+    _notebook_lock: Option<fs::File>,
+    mcp: Option<mcp::McpServer>,
+    mcp_error: Option<String>,
+    mcp_edit: Option<McpEdit>,
     settings: Settings,
     /// Token field in the settings dialog. The real token lives in the OS keyring.
     token_input: String,
     show_settings: bool,
+    settings_mcp: bool,
     settings_error: Option<String>,
     dirty_since: Option<Instant>,
     last_change: Option<Instant>,
@@ -58,22 +67,35 @@ pub(crate) struct NotebookApp {
     linux_caption: Option<crate::linux_caption::LinuxCaption>,
 }
 
+struct McpEdit {
+    previous: String,
+    inserted: Option<Range<usize>>,
+    highlight_until: f64,
+    reveal: bool,
+}
+
 impl NotebookApp {
-    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> io::Result<Self> {
         configure_context(&cc.egui_ctx);
         set_windows_title_bar_colors(cc);
         #[cfg(target_os = "windows")]
         win_chrome::install_from(cc);
         let paths = Paths::new();
+        let lock = notebook::lock(&paths.data_dir)?;
         let settings = load_settings(&paths.settings);
-        let text = fs::read_to_string(&paths.notebook).unwrap_or_default();
+        let text = notebook::read(&paths.notebook)?;
         let token_input = crate::keyring_store::load_token().unwrap_or_default();
-        Self {
+        let mut app = Self {
             text,
             paths,
+            _notebook_lock: Some(lock),
+            mcp: None,
+            mcp_error: None,
+            mcp_edit: None,
             settings,
             token_input,
             show_settings: false,
+            settings_mcp: false,
             settings_error: None,
             dirty_since: None,
             last_change: None,
@@ -87,12 +109,165 @@ impl NotebookApp {
             window_corners: crate::linux_window::WindowCorners::new(cc),
             #[cfg(target_os = "linux")]
             linux_caption: crate::linux_caption::LinuxCaption::new(&cc.egui_ctx),
+        };
+        match fs::read_to_string(app.paths.data_dir.join(mcp::TOKEN_FILE)) {
+            Ok(token) => match mcp::McpServer::start(cc.egui_ctx.clone(), token) {
+                Ok(server) => app.mcp = Some(server),
+                Err(error) => app.mcp_error = Some(format!("Could not start MCP: {error}")),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => app.mcp_error = Some(format!("Could not load MCP approval: {error}")),
         }
+        Ok(app)
     }
 
     fn save_notebook(&mut self) -> Result<(), String> {
-        fs::create_dir_all(&self.paths.data_dir).map_err(|e| e.to_string())?;
-        fs::write(&self.paths.notebook, &self.text).map_err(|e| e.to_string())
+        notebook::save(&self.paths.notebook, &self.text).map_err(|error| error.to_string())
+    }
+
+    fn approve_mcp(&mut self, ctx: &egui::Context) -> io::Result<()> {
+        let server = mcp::McpServer::start(ctx.clone(), mcp::new_token()?)?;
+        notebook::save(&self.paths.data_dir.join(mcp::TOKEN_FILE), &server.token)?;
+        self.mcp = Some(server);
+        Ok(())
+    }
+
+    fn revoke_mcp(&mut self) -> io::Result<()> {
+        let result = fs::remove_file(self.paths.data_dir.join(mcp::TOKEN_FILE));
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
+        {
+            return result;
+        }
+        self.mcp = None;
+        Ok(())
+    }
+
+    fn show_mcp_settings(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label("MCP access");
+        if let Some(server) = &self.mcp {
+            ui.label("An approved client can read and edit this notebook while Think is open.");
+            ui.horizontal(|ui| {
+                if ui.button("Copy URL").clicked() {
+                    ui.ctx().copy_text(mcp::URL.to_owned());
+                }
+                if ui.button("Copy access token").clicked() {
+                    ui.ctx().copy_text(server.token.clone());
+                }
+            });
+            if ui.button("Revoke access").clicked() {
+                self.mcp_error = self.revoke_mcp().err().map(|error| error.to_string());
+            }
+        } else {
+            ui.label("Approve a local MCP client to read and edit this notebook.");
+            if ui.button("Approve MCP client").clicked() {
+                self.mcp_error = self
+                    .approve_mcp(ui.ctx())
+                    .err()
+                    .map(|error| error.to_string());
+            }
+        }
+        if let Some(error) = &self.mcp_error {
+            ui.colored_label(Color32::from_rgb(232, 120, 120), error);
+        }
+    }
+
+    fn process_mcp(&mut self, ctx: &egui::Context) {
+        // Give the editor a frame even if an approved client keeps sending requests.
+        for _ in 0..32 {
+            let Some(request) = self
+                .mcp
+                .as_mut()
+                .and_then(|server| server.requests.try_recv().ok())
+            else {
+                return;
+            };
+            if request.reply.is_closed() {
+                continue;
+            }
+            let (result, edit) = request.run(&self.text, |text| {
+                notebook::save(&self.paths.notebook, text)
+            });
+            if let Some(edit) = edit {
+                let previous = self.replace_after_mcp(ctx, edit.text);
+                self.mcp_edit = Some(McpEdit {
+                    previous,
+                    reveal: edit.inserted.is_some(),
+                    inserted: edit.inserted,
+                    highlight_until: ctx.input(|input| input.time) + MCP_HIGHLIGHT_SECONDS,
+                });
+            }
+            let _ = request.reply.send(result);
+        }
+        ctx.request_repaint();
+    }
+
+    fn undo_mcp_edit(&mut self, ctx: &egui::Context) {
+        if let Some(edit) = &self.mcp_edit {
+            match notebook::save(&self.paths.notebook, &edit.previous) {
+                Ok(()) => {
+                    let previous = self.mcp_edit.take().expect("MCP edit is present").previous;
+                    self.replace_after_mcp(ctx, previous);
+                }
+                Err(error) => self.mcp_error = Some(format!("Could not undo MCP edit: {error}")),
+            }
+        }
+    }
+
+    fn replace_after_mcp(&mut self, ctx: &egui::Context, text: String) -> String {
+        let previous = std::mem::replace(&mut self.text, text);
+        self.dirty_since = None;
+        self.last_change = Some(Instant::now());
+        // Undo history predating the external change could overwrite it.
+        let id = egui::Id::new(EDITOR_ID);
+        if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+            let caret = state.cursor.char_range().map(|range| {
+                let index = remap_caret(&previous, &self.text, range.primary.index);
+                egui::text::CCursorRange::one(egui::text::CCursor::new(index))
+            });
+            state.clear_undoer();
+            state.cursor.set_char_range(caret);
+            state.store(ctx, id);
+        }
+        ctx.request_repaint();
+        previous
+    }
+
+    fn mcp_highlight(&mut self, ctx: &egui::Context) -> Option<(Range<usize>, Color32)> {
+        let edit = self.mcp_edit.as_mut()?;
+        let inserted = edit.inserted.as_ref()?;
+        let (now, activity) = ctx.input(|input| {
+            (
+                input.time,
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton { pressed: true, .. }
+                            | egui::Event::Key { pressed: true, .. }
+                            | egui::Event::MouseWheel { .. }
+                    )
+                }),
+            )
+        });
+        if now >= edit.highlight_until {
+            return None;
+        }
+        if activity {
+            edit.highlight_until = now + MCP_HIGHLIGHT_SECONDS;
+        }
+        let remaining = edit.highlight_until - now;
+        let alpha = (remaining / MCP_HIGHLIGHT_FADE_SECONDS).min(1.0);
+        ctx.request_repaint_after(Duration::from_secs_f64(if alpha < 1.0 {
+            remaining.min(1.0 / 60.0)
+        } else {
+            (remaining - MCP_HIGHLIGHT_FADE_SECONDS).max(1.0 / 60.0)
+        }));
+        Some((
+            inserted.clone(),
+            Color32::from_rgba_unmultiplied(90, 160, 115, (alpha * 105.0) as u8),
+        ))
     }
 
     fn save_settings(&self) -> Result<(), String> {
@@ -279,6 +454,13 @@ impl NotebookApp {
                             }
 
                             self.sync_status(ui);
+                            if self.mcp_edit.is_some() {
+                                let undo = ui.small_button("Undo MCP edit");
+                                control_hovered |= undo.hovered();
+                                if undo.clicked() {
+                                    self.undo_mcp_edit(ctx);
+                                }
+                            }
                         });
                     });
                 });
@@ -550,6 +732,7 @@ impl NotebookApp {
                     scroll_output.state.store(ui.ctx(), scroll_output.id);
                 }
                 if changed {
+                    self.mcp_edit = None;
                     self.dirty_since = Some(Instant::now());
                 }
                 if let Some(t) = self.dirty_since {
@@ -600,7 +783,7 @@ impl NotebookApp {
                     }
                 });
 
-            egui::Window::new("Sync settings")
+            egui::Window::new("Settings")
                 .title_bar(false)
                 .movable(false)
                 .resizable(false)
@@ -623,6 +806,17 @@ impl NotebookApp {
                     ui.set_width(400.0);
                     if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
                         close_settings = true;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.settings_mcp, false, "GitHub sync");
+                        ui.selectable_value(&mut self.settings_mcp, true, "MCP access");
+                    });
+                    if self.settings_mcp {
+                        self.show_mcp_settings(ui);
+                        if ui.button("Done").clicked() {
+                            close_settings = true;
+                        }
+                        return;
                     }
                     ui.label(
                         egui::RichText::new("Sync settings")
@@ -728,16 +922,38 @@ impl NotebookApp {
         // box and the trailing pad add up to the window's height.
         let text_box_height =
             (available_height - TITLE_BAR_HEIGHT - 8.0 - BOTTOM_PAD - TEXT_BOX_SLACK).max(0.0);
+        let highlight = self.mcp_highlight(ui.ctx());
+        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            markdown_layouter(ui, text, wrap_width, highlight.as_ref())
+        };
         let output = TextEdit::multiline(&mut self.text)
             .id(egui::Id::new(EDITOR_ID))
             .code_editor()
             .font(FontId::monospace(14.0))
-            .layouter(&mut markdown_layouter)
+            .layouter(&mut layouter)
             .desired_width(ui.available_width())
             .min_size(egui::vec2(0.0, text_box_height))
             .frame(false)
             .hint_text("Start writing...")
             .show(ui);
+        if let Some(edit) = &mut self.mcp_edit {
+            if std::mem::take(&mut edit.reveal) {
+                if let Some(before) = edit
+                    .inserted
+                    .as_ref()
+                    .and_then(|range| self.text.get(..range.start))
+                {
+                    let cursor = egui::text::CCursor::new(before.chars().count());
+                    let row = output
+                        .galley
+                        .pos_from_cursor(&output.galley.from_ccursor(cursor));
+                    let row = row.translate(output.galley_pos.to_vec2());
+                    if row.top() < view_top + TITLE_BAR_HEIGHT || row.bottom() > view_bottom {
+                        ui.scroll_to_rect(row, Some(egui::Align::Center));
+                    }
+                }
+            }
+        }
         // The text as painted, which already holds this pass's keys. The box
         // behind `ui.cursor()` does not: the text edit sized it before applying
         // them.
@@ -799,6 +1015,7 @@ impl NotebookApp {
 impl eframe::App for NotebookApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.draw(ctx);
+        self.process_mcp(ctx);
         #[cfg(target_os = "linux")]
         self.window_corners.update(ctx);
     }
@@ -818,6 +1035,34 @@ pub(crate) fn load_settings(path: &Path) -> Settings {
         .unwrap_or_default()
 }
 
+// Keep the caret anchored to text outside the changed span. Inside it, place
+// the caret at the start of the change and clear any old selection.
+fn remap_caret(previous: &str, current: &str, index: usize) -> usize {
+    let prefix = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if index <= prefix {
+        return index;
+    }
+    let previous_len = previous.chars().count();
+    let current_len = current.chars().count();
+    let index = index.min(previous_len);
+    let suffix = previous
+        .chars()
+        .rev()
+        .zip(current.chars().rev())
+        .take(previous_len.min(current_len) - prefix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if index >= previous_len - suffix {
+        current_len - (previous_len - index)
+    } else {
+        prefix
+    }
+}
+
 #[cfg(test)]
 mod harness {
     use std::path::PathBuf;
@@ -828,6 +1073,10 @@ mod harness {
     fn open_app(dir: &Path, text: &str) -> NotebookApp {
         NotebookApp {
             text: text.to_owned(),
+            _notebook_lock: None,
+            mcp: None,
+            mcp_error: None,
+            mcp_edit: None,
             paths: Paths {
                 data_dir: dir.to_path_buf(),
                 notebook: dir.join("notebook.txt"),
@@ -837,6 +1086,7 @@ mod harness {
             settings: Settings::default(),
             token_input: String::new(),
             show_settings: false,
+            settings_mcp: false,
             settings_error: None,
             dirty_since: None,
             last_change: None,
@@ -1188,6 +1438,62 @@ mod tests {
     use super::*;
     use egui::Key;
     use harness::{report, Notebook};
+
+    #[test]
+    fn mcp_highlight_fades_after_idle_and_undo_still_restores_the_note() {
+        let mut nb = Notebook::open("first\ninserted\n", 600.0, 1.0);
+        nb.app.mcp_edit = Some(McpEdit {
+            previous: "first\n".to_owned(),
+            inserted: Some(6..15),
+            highlight_until: MCP_HIGHLIGHT_SECONDS,
+            reveal: false,
+        });
+        let mut opacity = Vec::new();
+        for time in [1.0, 4.8, 5.1] {
+            let _ = nb.ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    opacity.push(nb.app.mcp_highlight(ctx).map(|(_, color)| color.a()));
+                },
+            );
+        }
+        assert_eq!(opacity[0], Some(105));
+        assert!(opacity[1].is_some_and(|alpha| alpha < 105));
+        assert_eq!(opacity[2], None);
+        nb.app.undo_mcp_edit(&nb.ctx);
+        assert_eq!(nb.app.text, "first\n");
+        assert_eq!(
+            fs::read_to_string(&nb.app.paths.notebook).unwrap(),
+            "first\n"
+        );
+        assert!(nb.app.mcp_edit.is_none());
+    }
+
+    #[test]
+    fn typing_invalidates_undo_of_the_previous_mcp_edit() {
+        let mut nb = Notebook::open("AI text", 600.0, 1.0);
+        nb.app.mcp_edit = Some(McpEdit {
+            previous: String::new(),
+            inserted: Some(0..7),
+            highlight_until: MCP_HIGHLIGHT_SECONDS,
+            reveal: false,
+        });
+        nb.caret_to_end();
+        nb.type_text(" plus mine");
+        nb.app.undo_mcp_edit(&nb.ctx);
+        assert_eq!(nb.app.text, "AI text plus mine");
+        assert!(nb.app.mcp_edit.is_none());
+    }
+
+    #[test]
+    fn mcp_edits_keep_the_caret_anchored_to_unchanged_unicode_text() {
+        assert_eq!(remap_caret("élast", "énew last", 3), 7);
+        assert_eq!(remap_caret("élast", "énew last", 1), 1);
+        assert_eq!(remap_caret("abcde", "axyze", 3), 1);
+    }
 
     /// The user's session: reach the end with Ctrl+End, then write.
     fn writing_session(height: f32, ppp: f32) -> (Notebook, usize) {
