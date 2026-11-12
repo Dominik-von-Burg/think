@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use super::{NotebookApp, SettingsDialog, SettingsPage};
 use crate::mcp;
+use crate::sync::SyncError;
 
 const MUTED: Color32 = Color32::from_rgb(164, 166, 174);
 const ERROR: Color32 = Color32::from_rgb(236, 139, 132);
@@ -93,6 +94,13 @@ impl NotebookApp {
         let can_sync = self.sync_configured()
             && !self.sync_in_progress
             && (self.paths.notebook.is_file() || self.dirty_since.is_some());
+        let conflict = match &self.sync_error {
+            Some(SyncError::Conflict { remote, .. }) => Some(remote.clone()),
+            _ => None,
+        };
+        if dialog.replacement.is_some() && dialog.replacement != conflict {
+            dialog.replacement = None;
+        }
         card(ui, |ui| {
             let (title, color, description) = if self.sync_in_progress {
                 ("Syncing", MUTED, "Sending your notebook to GitHub.")
@@ -125,7 +133,7 @@ impl NotebookApp {
             }
             if let Some(error) = &self.sync_error {
                 ui.add(
-                    egui::Label::new(RichText::new(error).size(13.0))
+                    egui::Label::new(RichText::new(error.to_string()).size(13.0))
                         .wrap()
                         .selectable(true),
                 );
@@ -141,14 +149,36 @@ impl NotebookApp {
                         .add_enabled(can_sync, egui::Button::new(action))
                         .clicked()
                     {
-                        self.sync_now();
+                        self.sync_now(None);
                     }
                     if let Some(error) = &self.sync_error {
                         if ui.button("Copy details").clicked() {
-                            ui.ctx().copy_text(error.clone());
+                            ui.ctx().copy_text(error.to_string());
                         }
                     }
                 });
+            }
+            if let Some(remote) = &conflict {
+                ui.hyperlink_to("Open GitHub repository", &remote.repository_url);
+                if dialog.replacement.is_some() {
+                    ui.label("Upload the current local text? This will replace the GitHub version shown in this conflict.");
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_sync, egui::Button::new("Confirm upload"))
+                            .clicked()
+                        {
+                            self.sync_now(dialog.replacement.take());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            dialog.replacement = None;
+                        }
+                    });
+                } else if ui
+                    .add_enabled(can_sync, egui::Button::new("Use local version"))
+                    .clicked()
+                {
+                    dialog.replacement = Some(remote.clone());
+                }
             }
         });
         ui.add_space(8.0);

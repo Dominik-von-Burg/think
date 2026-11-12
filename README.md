@@ -1,6 +1,6 @@
 # think
 
-A private, automatically synced plain-text notebook. It saves your notes to `notebook.txt` and, after 3 seconds without typing, commits and pushes the file to a private GitHub repository.
+A private, automatically synced plain-text notebook. It saves your notes to `notebook.txt` and, after 3 seconds without typing, updates that file on the default branch of a private GitHub repository.
 
 ## Build
 
@@ -37,13 +37,15 @@ which every current desktop distribution ships.
 
 ## Sync setup
 
-1. Create an empty private GitHub repository.
+1. Choose or create a private GitHub repository.
 2. Open the gear in the app and enter the repository's HTTPS URL.
 3. Create a fine-grained personal access token with read/write access to the repository's Contents, and paste it in.
 
 The token is stored in your OS credential store (Windows Credential Manager, Linux Secret Service / GNOME Keyring). The repository URL is stored in `settings.toml` in the app's data directory (`~/.local/share/think/` on Linux, `%LOCALAPPDATA%\think\` on Windows).
 
 If a sync fails, click **Sync failed** in the title bar to see the reason. Use **Copy details** to copy the error or **Retry sync** to try again without editing the notebook.
+
+Think uses the GitHub Contents API and only updates `notebook.txt`. Changes to other files in the repository can continue normally. If the GitHub copy of `notebook.txt` changed, compare it with your local notebook. You can then explicitly upload the local copy from the sync panel. Think checks that the GitHub version has stayed the same before replacing it.
 
 ## MCP server
 
