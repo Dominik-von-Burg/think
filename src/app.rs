@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::markdown::{link_at_char, markdown_layouter};
 use crate::paths::Paths;
 use crate::scroll::*;
-use crate::sync::commit_and_push;
+use crate::sync::{sync_notebook, RemoteVersion, SyncError};
 use crate::title_bar::*;
 use crate::trace::scroll_log;
 use crate::{configure_context, set_windows_title_bar_colors, APP_NAME};
@@ -51,9 +51,9 @@ pub(crate) struct NotebookApp {
     dirty_since: Option<Instant>,
     last_change: Option<Instant>,
     sync_in_progress: bool,
-    sync_error: Option<String>,
+    sync_error: Option<SyncError>,
     synced: bool,
-    sync_receiver: Option<Receiver<Result<(), String>>>,
+    sync_receiver: Option<Receiver<(String, Result<(), SyncError>)>>,
     /// Painted strength of each fade band, 0.0..=1.0, eased towards the strength
     /// the scroll position calls for so a band never pops in or out.
     fade_top: f32,
@@ -79,6 +79,7 @@ struct SettingsDialog {
     token: String,
     saved: bool,
     error: Option<String>,
+    replacement: Option<RemoteVersion>,
 }
 
 struct McpEdit {
@@ -262,6 +263,7 @@ impl NotebookApp {
             token: self.sync_token.clone().unwrap_or_default(),
             saved: false,
             error: None,
+            replacement: None,
         });
         dialog.page = page;
     }
@@ -301,58 +303,55 @@ impl NotebookApp {
         !self.settings.repo_url.trim().is_empty() && self.sync_token.is_some()
     }
 
-    fn start_sync(&mut self) {
+    fn start_sync(&mut self, approved: Option<RemoteVersion>) {
         if !self.sync_configured() || self.sync_in_progress {
             return;
         }
         let token = self.sync_token.clone().expect("sync has a token");
         let notebook = self.paths.notebook.clone();
-        let repository = self.paths.repository.clone();
+        let data_dir = self.paths.data_dir.clone();
         let repo_url = self.settings.repo_url.clone();
         let (sender, receiver) = mpsc::channel();
         self.sync_in_progress = true;
         self.sync_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let result =
-                commit_and_push(&notebook, &repository, &repo_url, &token).map_err(|message| {
-                    message
-                        .replace(&repo_url, "[repository URL]")
-                        .replace(&token, "[redacted]")
-                });
-            let _ = sender.send(result);
+            let result = sync_notebook(&notebook, &data_dir, &repo_url, &token, approved.as_ref());
+            let _ = sender.send((repo_url, result));
         });
     }
 
-    fn sync_now(&mut self) {
+    fn sync_now(&mut self, approved: Option<RemoteVersion>) {
         if self.dirty_since.is_some() {
             if let Err(error) = self.save_notebook() {
-                self.sync_error = Some(format!(
-                    "Could not save the notebook before syncing: {error}"
-                ));
+                self.sync_error =
+                    Some(format!("Could not save the notebook before syncing: {error}").into());
                 return;
             }
             self.dirty_since = None;
         }
         self.last_change = None;
-        self.start_sync();
+        self.start_sync(approved);
     }
 
     fn collect_finished_sync(&mut self) {
-        let result = match self.sync_receiver.as_ref() {
-            Some(receiver) => match receiver.try_recv() {
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    Err("The sync worker stopped unexpectedly.".to_owned())
-                }
-                Ok(result) => result,
-            },
-            None => return,
+        let Some(receiver) = &self.sync_receiver else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Some(Err("The sync worker stopped unexpectedly."
+                .to_owned()
+                .into())),
+            Ok((repo_url, result)) if repo_url == self.settings.repo_url => Some(result),
+            Ok(_) => None,
         };
         self.sync_in_progress = false;
         self.sync_receiver = None;
-        self.synced = result.is_ok();
-        self.sync_error = result.err();
+        if let Some(result) = result {
+            self.synced = result.is_ok();
+            self.sync_error = result.err();
+        }
     }
 
     fn sync_status(&mut self, ui: &mut egui::Ui) -> bool {
@@ -797,7 +796,7 @@ impl NotebookApp {
             let elapsed = changed_at.elapsed();
             if elapsed >= DEBOUNCE && !self.sync_in_progress {
                 self.last_change = None;
-                self.start_sync();
+                self.start_sync(None);
             } else if elapsed >= DEBOUNCE {
                 // Keep this change queued until the current background push finishes.
                 ctx.request_repaint_after(Duration::from_millis(100));
@@ -1015,7 +1014,6 @@ mod harness {
                 data_dir: dir.to_path_buf(),
                 notebook: dir.join("notebook.txt"),
                 settings: dir.join("settings.toml"),
-                repository: dir.join("repository"),
             },
             settings: Settings::default(),
             sync_token: None,
@@ -1376,7 +1374,7 @@ mod tests {
     fn sync_settings_paints_the_failure_reason_without_hovering() {
         let mut nb = Notebook::open("note", 650.0, 1.0);
         let error = "Could not push to GitHub: connection timed out";
-        nb.app.sync_error = Some(error.to_owned());
+        nb.app.sync_error = Some(error.to_owned().into());
         nb.app.open_settings(SettingsPage::Sync);
         for _ in 0..4 {
             let output = nb.ctx.run(
