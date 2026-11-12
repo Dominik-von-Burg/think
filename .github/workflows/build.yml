@@ -69,6 +69,10 @@ jobs:
         if: matrix.name == 'linux-x86_64'
         run: xvfb-run -a -s '-screen 0 1280x900x24' bash tests/linux-desktop.sh target/${{ matrix.target }}/release/${{ matrix.binary }}
 
+      - name: Test MCP with the Linux desktop app
+        if: matrix.name == 'linux-x86_64'
+        run: xvfb-run -a -s '-screen 0 1280x900x24' python3 tests/mcp-http.py target/${{ matrix.target }}/release/${{ matrix.binary }}
+
       - name: Package
         shell: bash
         env:

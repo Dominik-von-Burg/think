@@ -1,7 +1,8 @@
 //! The notebook's state and the frame it paints.
 
 use std::{
-    fs,
+    fs, io,
+    ops::Range,
     path::Path,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -19,6 +20,9 @@ use crate::sync::commit_and_push;
 use crate::title_bar::*;
 use crate::trace::scroll_log;
 use crate::{configure_context, set_windows_title_bar_colors, APP_NAME};
+use crate::{mcp, notebook};
+
+mod settings_ui;
 
 #[cfg(target_os = "windows")]
 use crate::win_chrome;
@@ -26,6 +30,8 @@ use crate::win_chrome;
 pub(crate) const DEBOUNCE: Duration = Duration::from_secs(3);
 
 pub(crate) const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+const MCP_HIGHLIGHT_SECONDS: f64 = 5.0;
+const MCP_HIGHLIGHT_FADE_SECONDS: f64 = 0.4;
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub(crate) struct Settings {
@@ -35,15 +41,18 @@ pub(crate) struct Settings {
 pub(crate) struct NotebookApp {
     text: String,
     paths: Paths,
+    _notebook_lock: Option<fs::File>,
+    mcp: Option<mcp::McpServer>,
+    mcp_error: Option<String>,
+    mcp_edit: Option<McpEdit>,
     settings: Settings,
-    /// Token field in the settings dialog. The real token lives in the OS keyring.
-    token_input: String,
-    show_settings: bool,
-    settings_error: Option<String>,
+    sync_token: Option<String>,
+    settings_dialog: Option<SettingsDialog>,
     dirty_since: Option<Instant>,
     last_change: Option<Instant>,
     sync_in_progress: bool,
     sync_error: Option<String>,
+    synced: bool,
     sync_receiver: Option<Receiver<Result<(), String>>>,
     /// Painted strength of each fade band, 0.0..=1.0, eased towards the strength
     /// the scroll position calls for so a band never pops in or out.
@@ -58,27 +67,55 @@ pub(crate) struct NotebookApp {
     linux_caption: Option<crate::linux_caption::LinuxCaption>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Sync,
+    Mcp,
+}
+
+struct SettingsDialog {
+    page: SettingsPage,
+    repo_url: String,
+    token: String,
+    saved: bool,
+    error: Option<String>,
+}
+
+struct McpEdit {
+    previous: String,
+    inserted: Option<Range<usize>>,
+    highlight_until: f64,
+    reveal: bool,
+}
+
 impl NotebookApp {
-    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> io::Result<Self> {
         configure_context(&cc.egui_ctx);
         set_windows_title_bar_colors(cc);
         #[cfg(target_os = "windows")]
         win_chrome::install_from(cc);
         let paths = Paths::new();
+        let lock = notebook::lock(&paths.data_dir)?;
         let settings = load_settings(&paths.settings);
-        let text = fs::read_to_string(&paths.notebook).unwrap_or_default();
-        let token_input = crate::keyring_store::load_token().unwrap_or_default();
-        Self {
+        let text = notebook::read(&paths.notebook)?;
+        let sync_token = crate::keyring_store::load_token()
+            .ok()
+            .filter(|token| !token.trim().is_empty());
+        let mut app = Self {
             text,
             paths,
+            _notebook_lock: Some(lock),
+            mcp: None,
+            mcp_error: None,
+            mcp_edit: None,
             settings,
-            token_input,
-            show_settings: false,
-            settings_error: None,
+            sync_token,
+            settings_dialog: None,
             dirty_since: None,
             last_change: None,
             sync_in_progress: false,
             sync_error: None,
+            synced: false,
             sync_receiver: None,
             fade_top: 0.0,
             fade_bottom: 0.0,
@@ -87,84 +124,265 @@ impl NotebookApp {
             window_corners: crate::linux_window::WindowCorners::new(cc),
             #[cfg(target_os = "linux")]
             linux_caption: crate::linux_caption::LinuxCaption::new(&cc.egui_ctx),
+        };
+        match fs::read_to_string(app.paths.data_dir.join(mcp::TOKEN_FILE)) {
+            Ok(token) => match mcp::McpServer::start(cc.egui_ctx.clone(), token) {
+                Ok(server) => app.mcp = Some(server),
+                Err(error) => app.mcp_error = Some(format!("Could not start MCP: {error}")),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => app.mcp_error = Some(format!("Could not load MCP approval: {error}")),
         }
+        Ok(app)
     }
 
     fn save_notebook(&mut self) -> Result<(), String> {
-        fs::create_dir_all(&self.paths.data_dir).map_err(|e| e.to_string())?;
-        fs::write(&self.paths.notebook, &self.text).map_err(|e| e.to_string())
+        notebook::save(&self.paths.notebook, &self.text).map_err(|error| error.to_string())
     }
 
-    fn save_settings(&self) -> Result<(), String> {
-        fs::create_dir_all(&self.paths.data_dir).map_err(|e| e.to_string())?;
-        let contents = toml::to_string(&self.settings).map_err(|e| e.to_string())?;
-        fs::write(&self.paths.settings, contents).map_err(|e| e.to_string())?;
-        if self.token_input.trim().is_empty() {
-            crate::keyring_store::delete_token().ok();
+    fn approve_mcp(&mut self, ctx: &egui::Context) -> io::Result<()> {
+        let server = mcp::McpServer::start(ctx.clone(), mcp::new_token()?)?;
+        notebook::save(&self.paths.data_dir.join(mcp::TOKEN_FILE), &server.token)?;
+        self.mcp = Some(server);
+        Ok(())
+    }
+
+    fn revoke_mcp(&mut self) -> io::Result<()> {
+        let result = fs::remove_file(self.paths.data_dir.join(mcp::TOKEN_FILE));
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
+        {
+            return result;
+        }
+        self.mcp = None;
+        Ok(())
+    }
+
+    fn process_mcp(&mut self, ctx: &egui::Context) {
+        // Give the editor a frame even if an approved client keeps sending requests.
+        for _ in 0..32 {
+            let Some(request) = self
+                .mcp
+                .as_mut()
+                .and_then(|server| server.requests.try_recv().ok())
+            else {
+                return;
+            };
+            if request.reply.is_closed() {
+                continue;
+            }
+            let (result, edit) = request.run(&self.text, |text| {
+                notebook::save(&self.paths.notebook, text)
+            });
+            if let Some(edit) = edit {
+                let previous = self.replace_after_mcp(ctx, edit.text);
+                self.mcp_edit = Some(McpEdit {
+                    previous,
+                    reveal: edit.inserted.is_some(),
+                    inserted: edit.inserted,
+                    highlight_until: ctx.input(|input| input.time) + MCP_HIGHLIGHT_SECONDS,
+                });
+            }
+            let _ = request.reply.send(result);
+        }
+        ctx.request_repaint();
+    }
+
+    fn undo_mcp_edit(&mut self, ctx: &egui::Context) {
+        if let Some(edit) = &self.mcp_edit {
+            match notebook::save(&self.paths.notebook, &edit.previous) {
+                Ok(()) => {
+                    let previous = self.mcp_edit.take().expect("MCP edit is present").previous;
+                    self.replace_after_mcp(ctx, previous);
+                }
+                Err(error) => self.mcp_error = Some(format!("Could not undo MCP edit: {error}")),
+            }
+        }
+    }
+
+    fn replace_after_mcp(&mut self, ctx: &egui::Context, text: String) -> String {
+        let previous = std::mem::replace(&mut self.text, text);
+        self.dirty_since = None;
+        self.last_change = Some(Instant::now());
+        // Undo history predating the external change could overwrite it.
+        let id = egui::Id::new(EDITOR_ID);
+        if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+            let caret = state.cursor.char_range().map(|range| {
+                let index = remap_caret(&previous, &self.text, range.primary.index);
+                egui::text::CCursorRange::one(egui::text::CCursor::new(index))
+            });
+            state.clear_undoer();
+            state.cursor.set_char_range(caret);
+            state.store(ctx, id);
+        }
+        ctx.request_repaint();
+        previous
+    }
+
+    fn mcp_highlight(&mut self, ctx: &egui::Context) -> Option<(Range<usize>, Color32)> {
+        let edit = self.mcp_edit.as_mut()?;
+        let inserted = edit.inserted.as_ref()?;
+        let (now, activity) = ctx.input(|input| {
+            (
+                input.time,
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton { pressed: true, .. }
+                            | egui::Event::Key { pressed: true, .. }
+                            | egui::Event::MouseWheel { .. }
+                    )
+                }),
+            )
+        });
+        if now >= edit.highlight_until {
+            return None;
+        }
+        if activity {
+            edit.highlight_until = now + MCP_HIGHLIGHT_SECONDS;
+        }
+        let remaining = edit.highlight_until - now;
+        let alpha = (remaining / MCP_HIGHLIGHT_FADE_SECONDS).min(1.0);
+        ctx.request_repaint_after(Duration::from_secs_f64(if alpha < 1.0 {
+            remaining.min(1.0 / 60.0)
         } else {
-            crate::keyring_store::save_token(self.token_input.trim())?;
+            (remaining - MCP_HIGHLIGHT_FADE_SECONDS).max(1.0 / 60.0)
+        }));
+        Some((
+            inserted.clone(),
+            Color32::from_rgba_unmultiplied(90, 160, 115, (alpha * 105.0) as u8),
+        ))
+    }
+
+    fn open_settings(&mut self, page: SettingsPage) {
+        let dialog = self.settings_dialog.get_or_insert_with(|| SettingsDialog {
+            page,
+            repo_url: self.settings.repo_url.clone(),
+            token: self.sync_token.clone().unwrap_or_default(),
+            saved: false,
+            error: None,
+        });
+        dialog.page = page;
+    }
+
+    fn save_settings(&mut self, dialog: &SettingsDialog) -> Result<(), String> {
+        let settings = Settings {
+            repo_url: dialog.repo_url.trim().to_owned(),
+        };
+        let token = (!dialog.token.trim().is_empty()).then(|| dialog.token.trim().to_owned());
+        let token_changed = self.sync_token != token;
+        let changed = token_changed || self.settings.repo_url != settings.repo_url;
+        let contents = toml::to_string(&settings).map_err(|error| error.to_string())?;
+        if token_changed {
+            store_sync_token(token.as_deref())?;
+        }
+        if let Err(error) = notebook::save(&self.paths.settings, &contents) {
+            if token_changed {
+                store_sync_token(self.sync_token.as_deref()).map_err(|rollback| {
+                    format!("Could not save settings: {error}. Could not restore the previous keyring entry: {rollback}")
+                })?;
+            }
+            return Err(format!("Could not save settings: {error}"));
+        }
+        self.settings = settings;
+        self.sync_token = token;
+        if changed {
+            self.sync_error = None;
+            self.synced = false;
+            if self.sync_configured() && self.paths.notebook.is_file() {
+                self.last_change = Some(Instant::now());
+            }
         }
         Ok(())
     }
 
+    fn sync_configured(&self) -> bool {
+        !self.settings.repo_url.trim().is_empty() && self.sync_token.is_some()
+    }
+
     fn start_sync(&mut self) {
-        let token = match crate::keyring_store::load_token() {
-            Ok(t) if !t.trim().is_empty() => t,
-            _ => return,
-        };
-        if self.settings.repo_url.trim().is_empty() || self.sync_in_progress {
+        if !self.sync_configured() || self.sync_in_progress {
             return;
         }
-
+        let token = self.sync_token.clone().expect("sync has a token");
         let notebook = self.paths.notebook.clone();
         let repository = self.paths.repository.clone();
         let repo_url = self.settings.repo_url.clone();
         let (sender, receiver) = mpsc::channel();
         self.sync_in_progress = true;
-        self.sync_error = None;
         self.sync_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let _ = sender.send(commit_and_push(&notebook, &repository, &repo_url, &token));
+            let result =
+                commit_and_push(&notebook, &repository, &repo_url, &token).map_err(|message| {
+                    message
+                        .replace(&repo_url, "[repository URL]")
+                        .replace(&token, "[redacted]")
+                });
+            let _ = sender.send(result);
         });
+    }
+
+    fn sync_now(&mut self) {
+        if self.dirty_since.is_some() {
+            if let Err(error) = self.save_notebook() {
+                self.sync_error = Some(format!(
+                    "Could not save the notebook before syncing: {error}"
+                ));
+                return;
+            }
+            self.dirty_since = None;
+        }
+        self.last_change = None;
+        self.start_sync();
     }
 
     fn collect_finished_sync(&mut self) {
         let result = match self.sync_receiver.as_ref() {
             Some(receiver) => match receiver.try_recv() {
                 Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => Err("sync worker stopped".to_owned()),
+                Err(TryRecvError::Disconnected) => {
+                    Err("The sync worker stopped unexpectedly.".to_owned())
+                }
                 Ok(result) => result,
             },
             None => return,
         };
         self.sync_in_progress = false;
         self.sync_receiver = None;
-        if let Err(message) = result {
-            self.sync_error = Some(message);
-        }
+        self.synced = result.is_ok();
+        self.sync_error = result.err();
     }
 
-    /// Always-visible sync status in the title bar. Covers every state so a
-    /// sync that can't happen (not configured) or did fail is never silent.
-    fn sync_status(&self, ui: &mut egui::Ui) {
-        let configured =
-            !self.settings.repo_url.trim().is_empty() && crate::keyring_store::has_token();
-        if self.sync_in_progress {
-            sync_indicator(ui).on_hover_text("Syncing to GitHub…");
-        } else if let Some(error) = &self.sync_error {
-            ui.label(
-                egui::RichText::new("Sync failed")
-                    .color(Color32::from_rgb(232, 120, 120))
-                    .size(12.0),
+    fn sync_status(&mut self, ui: &mut egui::Ui) -> bool {
+        let response = if self.sync_in_progress
+            || (self.sync_configured() && self.last_change.is_some() && self.sync_error.is_none())
+        {
+            return sync_indicator(ui).on_hover_text("Sync pending").hovered();
+        } else if self.sync_error.is_some() {
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new("Sync failed")
+                        .color(Color32::from_rgb(236, 139, 132))
+                        .size(12.0),
+                )
+                .frame(false),
             )
-            .on_hover_text(error.as_str());
-        } else if !configured {
-            ui.label(egui::RichText::new("Not syncing").weak().size(12.0))
-                .on_hover_text("Add a GitHub repository and token in settings to sync your notes.");
-        } else if self.last_change.is_some() {
-            sync_indicator(ui).on_hover_text("Waiting to sync…");
+            .on_hover_text("Open sync details")
+        } else if !self.sync_configured() {
+            ui.add(
+                egui::Button::new(egui::RichText::new("Not syncing").weak().size(12.0))
+                    .frame(false),
+            )
+            .on_hover_text("Open GitHub sync settings")
+        } else {
+            return false;
+        };
+        if response.clicked() {
+            self.open_settings(SettingsPage::Sync);
         }
+        response.hovered()
     }
 
     fn caption_button(
@@ -272,13 +490,20 @@ impl NotebookApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let settings = title_bar_icon_button(ui, TitleBarIcon::Settings)
-                                .on_hover_text("GitHub settings");
+                                .on_hover_text("Settings");
                             control_hovered |= settings.hovered();
                             if settings.clicked() {
-                                self.show_settings = true;
+                                self.open_settings(SettingsPage::Sync);
                             }
 
-                            self.sync_status(ui);
+                            control_hovered |= self.sync_status(ui);
+                            if self.mcp_edit.is_some() {
+                                let undo = ui.small_button("Undo MCP edit");
+                                control_hovered |= undo.hovered();
+                                if undo.clicked() {
+                                    self.undo_mcp_edit(ctx);
+                                }
+                            }
                         });
                     });
                 });
@@ -550,6 +775,7 @@ impl NotebookApp {
                     scroll_output.state.store(ui.ctx(), scroll_output.id);
                 }
                 if changed {
+                    self.mcp_edit = None;
                     self.dirty_since = Some(Instant::now());
                 }
                 if let Some(t) = self.dirty_since {
@@ -584,113 +810,7 @@ impl NotebookApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // Centered modal dialog: dimmed backdrop (click outside or Escape to
-        // close), rounded surface, full-width fields.
-        let mut close_settings = false;
-        if self.show_settings {
-            egui::Area::new(egui::Id::new("settings_backdrop"))
-                .order(egui::Order::Middle)
-                .fixed_pos(ctx.screen_rect().min)
-                .show(ctx, |ui| {
-                    let screen = ctx.screen_rect();
-                    ui.painter()
-                        .rect_filled(screen, 0.0, Color32::from_black_alpha(140));
-                    if ui.allocate_rect(screen, egui::Sense::click()).clicked() {
-                        close_settings = true;
-                    }
-                });
-
-            egui::Window::new("Sync settings")
-                .title_bar(false)
-                .movable(false)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .default_width(440.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(Color32::from_rgb(30, 30, 30))
-                        .stroke(egui::Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                        ))
-                        .rounding(egui::Rounding::same(10.0))
-                        .inner_margin(egui::Margin::same(20.0)),
-                )
-                .show(ctx, |ui| {
-                    // Fixed content width: the window auto-sizes around it.
-                    // (INFINITY-width fields would stretch it full-window.)
-                    ui.set_width(400.0);
-                    if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
-                        close_settings = true;
-                    }
-                    ui.label(
-                        egui::RichText::new("Sync settings")
-                            .size(18.0)
-                            .color(Color32::from_rgb(232, 232, 232)),
-                    );
-                    ui.label(
-                        egui::RichText::new("Push your notebook to a private GitHub repository.")
-                            .weak(),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label("GitHub repository URL");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.repo_url)
-                            .hint_text("https://github.com/you/private-notebook.git"),
-                    );
-                    ui.add_space(8.0);
-                    ui.label("Personal Access Token");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.token_input)
-                            .password(true)
-                            .hint_text("Fine-grained token with Contents read/write"),
-                    );
-                    ui.label(
-                        egui::RichText::new("Stored in your system keyring.")
-                            .weak()
-                            .size(11.0),
-                    );
-                    if let Some(error) = &self.settings_error {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(error.as_str())
-                                .color(Color32::from_rgb(232, 120, 120))
-                                .size(12.0),
-                        );
-                    }
-                    ui.add_space(12.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Save").clicked() {
-                            match self.save_settings() {
-                                Ok(()) => {
-                                    self.settings_error = None;
-                                    close_settings = true;
-                                }
-                                Err(error) => {
-                                    self.settings_error = Some(error);
-                                }
-                            }
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.settings_error = None;
-                            close_settings = true;
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("The token is stored in your system keyring.")
-                            .weak()
-                            .small(),
-                    );
-                });
-
-            if close_settings {
-                self.show_settings = false;
-            }
-        }
+        self.draw_settings(ctx);
 
         // Arrow over the title bar: the editor's I-beam must not leak through
         // the floating header. Resize cursors still win on the border.
@@ -728,16 +848,38 @@ impl NotebookApp {
         // box and the trailing pad add up to the window's height.
         let text_box_height =
             (available_height - TITLE_BAR_HEIGHT - 8.0 - BOTTOM_PAD - TEXT_BOX_SLACK).max(0.0);
+        let highlight = self.mcp_highlight(ui.ctx());
+        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            markdown_layouter(ui, text, wrap_width, highlight.as_ref())
+        };
         let output = TextEdit::multiline(&mut self.text)
             .id(egui::Id::new(EDITOR_ID))
             .code_editor()
             .font(FontId::monospace(14.0))
-            .layouter(&mut markdown_layouter)
+            .layouter(&mut layouter)
             .desired_width(ui.available_width())
             .min_size(egui::vec2(0.0, text_box_height))
             .frame(false)
             .hint_text("Start writing...")
             .show(ui);
+        if let Some(edit) = &mut self.mcp_edit {
+            if std::mem::take(&mut edit.reveal) {
+                if let Some(before) = edit
+                    .inserted
+                    .as_ref()
+                    .and_then(|range| self.text.get(..range.start))
+                {
+                    let cursor = egui::text::CCursor::new(before.chars().count());
+                    let row = output
+                        .galley
+                        .pos_from_cursor(&output.galley.from_ccursor(cursor));
+                    let row = row.translate(output.galley_pos.to_vec2());
+                    if row.top() < view_top + TITLE_BAR_HEIGHT || row.bottom() > view_bottom {
+                        ui.scroll_to_rect(row, Some(egui::Align::Center));
+                    }
+                }
+            }
+        }
         // The text as painted, which already holds this pass's keys. The box
         // behind `ui.cursor()` does not: the text edit sized it before applying
         // them.
@@ -799,6 +941,7 @@ impl NotebookApp {
 impl eframe::App for NotebookApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.draw(ctx);
+        self.process_mcp(ctx);
         #[cfg(target_os = "linux")]
         self.window_corners.update(ctx);
     }
@@ -811,11 +954,47 @@ impl eframe::App for NotebookApp {
     }
 }
 
+fn store_sync_token(token: Option<&str>) -> Result<(), String> {
+    match token {
+        Some(token) => crate::keyring_store::save_token(token),
+        None => crate::keyring_store::delete_token(),
+    }
+    .map_err(|error| format!("Could not update the system keyring: {error}"))
+}
+
 pub(crate) fn load_settings(path: &Path) -> Settings {
     fs::read_to_string(path)
         .ok()
         .and_then(|contents| toml::from_str(&contents).ok())
         .unwrap_or_default()
+}
+
+// Keep the caret anchored to text outside the changed span. Inside it, place
+// the caret at the start of the change and clear any old selection.
+fn remap_caret(previous: &str, current: &str, index: usize) -> usize {
+    let prefix = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if index <= prefix {
+        return index;
+    }
+    let previous_len = previous.chars().count();
+    let current_len = current.chars().count();
+    let index = index.min(previous_len);
+    let suffix = previous
+        .chars()
+        .rev()
+        .zip(current.chars().rev())
+        .take(previous_len.min(current_len) - prefix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if index >= previous_len - suffix {
+        current_len - (previous_len - index)
+    } else {
+        prefix
+    }
 }
 
 #[cfg(test)]
@@ -828,6 +1007,10 @@ mod harness {
     fn open_app(dir: &Path, text: &str) -> NotebookApp {
         NotebookApp {
             text: text.to_owned(),
+            _notebook_lock: None,
+            mcp: None,
+            mcp_error: None,
+            mcp_edit: None,
             paths: Paths {
                 data_dir: dir.to_path_buf(),
                 notebook: dir.join("notebook.txt"),
@@ -835,13 +1018,13 @@ mod harness {
                 repository: dir.join("repository"),
             },
             settings: Settings::default(),
-            token_input: String::new(),
-            show_settings: false,
-            settings_error: None,
+            sync_token: None,
+            settings_dialog: None,
             dirty_since: None,
             last_change: None,
             sync_in_progress: false,
             sync_error: None,
+            synced: false,
             sync_receiver: None,
             fade_top: 0.0,
             fade_bottom: 0.0,
@@ -1188,6 +1371,88 @@ mod tests {
     use super::*;
     use egui::Key;
     use harness::{report, Notebook};
+
+    #[test]
+    fn sync_settings_paints_the_failure_reason_without_hovering() {
+        let mut nb = Notebook::open("note", 650.0, 1.0);
+        let error = "Could not push to GitHub: connection timed out";
+        nb.app.sync_error = Some(error.to_owned());
+        nb.app.open_settings(SettingsPage::Sync);
+        for _ in 0..4 {
+            let output = nb.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 650.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| nb.app.draw_settings(ctx),
+            );
+            if output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text == error)
+            }) {
+                return;
+            }
+        }
+        panic!("The open sync settings did not paint the failure reason");
+    }
+
+    #[test]
+    fn mcp_highlight_fades_after_idle_and_undo_still_restores_the_note() {
+        let mut nb = Notebook::open("first\ninserted\n", 600.0, 1.0);
+        nb.app.mcp_edit = Some(McpEdit {
+            previous: "first\n".to_owned(),
+            inserted: Some(6..15),
+            highlight_until: MCP_HIGHLIGHT_SECONDS,
+            reveal: false,
+        });
+        let mut opacity = Vec::new();
+        for time in [1.0, 4.8, 5.1] {
+            let _ = nb.ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    opacity.push(nb.app.mcp_highlight(ctx).map(|(_, color)| color.a()));
+                },
+            );
+        }
+        assert_eq!(opacity[0], Some(105));
+        assert!(opacity[1].is_some_and(|alpha| alpha < 105));
+        assert_eq!(opacity[2], None);
+        nb.app.undo_mcp_edit(&nb.ctx);
+        assert_eq!(nb.app.text, "first\n");
+        assert_eq!(
+            fs::read_to_string(&nb.app.paths.notebook).unwrap(),
+            "first\n"
+        );
+        assert!(nb.app.mcp_edit.is_none());
+    }
+
+    #[test]
+    fn typing_invalidates_undo_of_the_previous_mcp_edit() {
+        let mut nb = Notebook::open("AI text", 600.0, 1.0);
+        nb.app.mcp_edit = Some(McpEdit {
+            previous: String::new(),
+            inserted: Some(0..7),
+            highlight_until: MCP_HIGHLIGHT_SECONDS,
+            reveal: false,
+        });
+        nb.caret_to_end();
+        nb.type_text(" plus mine");
+        nb.app.undo_mcp_edit(&nb.ctx);
+        assert_eq!(nb.app.text, "AI text plus mine");
+        assert!(nb.app.mcp_edit.is_none());
+    }
+
+    #[test]
+    fn mcp_edits_keep_the_caret_anchored_to_unchanged_unicode_text() {
+        assert_eq!(remap_caret("élast", "énew last", 3), 7);
+        assert_eq!(remap_caret("élast", "énew last", 1), 1);
+        assert_eq!(remap_caret("abcde", "axyze", 3), 1);
+    }
 
     /// The user's session: reach the end with Ctrl+End, then write.
     fn writing_session(height: f32, ppp: f32) -> (Notebook, usize) {

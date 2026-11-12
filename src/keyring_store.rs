@@ -25,8 +25,3 @@ pub fn delete_token() -> Result<(), String> {
     let entry = keyring::Entry::new(SERVICE, USER).map_err(|e| e.to_string())?;
     entry.delete_credential().map_err(|e| e.to_string())
 }
-
-/// Check whether a token is already stored.
-pub fn has_token() -> bool {
-    load_token().is_ok()
-}

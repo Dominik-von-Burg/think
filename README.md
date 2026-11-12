@@ -23,6 +23,7 @@ and `xdotool` to check the window corners and autosave with a temporary notebook
 ```sh
 cargo build --locked
 xvfb-run -a -s '-screen 0 1280x900x24' bash tests/linux-desktop.sh target/debug/think
+xvfb-run -a -s '-screen 0 1280x900x24' python3 tests/mcp-http.py target/debug/think
 ```
 
 ## Downloads
@@ -42,15 +43,17 @@ which every current desktop distribution ships.
 
 The token is stored in your OS credential store (Windows Credential Manager, Linux Secret Service / GNOME Keyring). The repository URL is stored in `settings.toml` in the app's data directory (`~/.local/share/think/` on Linux, `%LOCALAPPDATA%\think\` on Windows).
 
+If a sync fails, click **Sync failed** in the title bar to see the reason. Use **Copy details** to copy the error or **Retry sync** to try again without editing the notebook.
+
 ## MCP server
 
-Think can run as a [Model Context Protocol](https://modelcontextprotocol.io/) server so that AI agents can read and edit your notebook:
+Think serves [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) while the desktop app is open. It is off until you open the gear, select **MCP access**, and click **Approve MCP client**.
 
-```sh
-think --mcp
-```
+Configure your local MCP client with the URL `http://127.0.0.1:8374/mcp` and an `Authorization: Bearer <token>` header. Use **Copy access token** in Think and treat the token like a password. Clients that support Streamable HTTP and a bearer header can connect directly. Remove any older command-based `think --mcp` configuration.
 
-It speaks JSON-RPC over stdio. Point your MCP client (Claude Desktop, Cursor, etc.) at the binary with the `--mcp` argument. The server exposes four tools: `read_notebook`, `write_notebook`, `insert_text`, and `search`.
+The endpoint listens only on loopback and rejects browser origins. The approved token grants read and write access. Think stores it in its per-user data directory and starts the endpoint on subsequent launches. **Revoke access** removes the approval and stops the endpoint. Approving again generates a new token.
+
+`read_notebook` and `search` return the live text or search results and a revision. Pass that revision as `expected_revision` to `insert_text` or `write_notebook`. If you type after the read, Think rejects the stale request. Successful edits appear in the editor and are saved immediately. Inserted text is highlighted until you have been idle for five seconds. **Undo MCP edit** is available until the next notebook edit.
 
 ## License
 
