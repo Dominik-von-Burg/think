@@ -12,6 +12,16 @@ cargo run --release
 
 On Windows, `.\build.ps1` builds `dist\Think.exe`.
 
+## Tests
+
+Run `cargo test --locked` on Linux or Windows. On Linux, install `xvfb`, `xauth`,
+and `xdotool` to check the window corners and autosave with a temporary notebook:
+
+```sh
+cargo build --locked
+xvfb-run -a -s '-screen 0 1280x900x24' bash tests/linux-desktop.sh target/debug/think
+```
+
 ## Downloads
 
 GitHub Actions builds both binaries on every push and pull request: `think-linux-x86_64.tar.gz`

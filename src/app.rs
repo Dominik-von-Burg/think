@@ -52,6 +52,8 @@ pub(crate) struct NotebookApp {
     /// The last pass moved the view and asked egui to paint the frame again: trace
     /// the pass that replaces it, which is the one on screen.
     trace_repaint: bool,
+    #[cfg(target_os = "linux")]
+    window_corners: crate::linux_window::WindowCorners,
 }
 
 impl NotebookApp {
@@ -63,10 +65,6 @@ impl NotebookApp {
         let paths = Paths::new();
         let settings = load_settings(&paths.settings);
         let text = fs::read_to_string(&paths.notebook).unwrap_or_default();
-        Self::with(paths, settings, text)
-    }
-
-    fn with(paths: Paths, settings: Settings, text: String) -> Self {
         let token_input = crate::keyring_store::load_token().unwrap_or_default();
         Self {
             text,
@@ -83,6 +81,8 @@ impl NotebookApp {
             fade_top: 0.0,
             fade_bottom: 0.0,
             trace_repaint: false,
+            #[cfg(target_os = "linux")]
+            window_corners: crate::linux_window::WindowCorners::new(cc),
         }
     }
 
@@ -778,6 +778,8 @@ impl NotebookApp {
 impl eframe::App for NotebookApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.draw(ctx);
+        #[cfg(target_os = "linux")]
+        self.window_corners.update(ctx);
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
@@ -823,6 +825,8 @@ mod harness {
             fade_top: 0.0,
             fade_bottom: 0.0,
             trace_repaint: false,
+            #[cfg(target_os = "linux")]
+            window_corners: Default::default(),
         }
     }
 
