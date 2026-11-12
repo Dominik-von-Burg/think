@@ -12,11 +12,13 @@ cargo run --release
 
 On Windows, `.\build.ps1` builds `dist\Think.exe`.
 
+On Linux, Think uses GTK 3 and the desktop icon theme to draw its window buttons
+when GTK is available.
+
 ## Tests
 
-Run `cargo test --locked` on Linux or Windows. On Debian or Ubuntu, install
-`xvfb`, `xauth`, `xdotool`, `x11-utils`, and `openbox` to check the native window
-frame and autosave with a temporary notebook:
+Run `cargo test --locked` on Linux or Windows. On Linux, install `xvfb`, `xauth`,
+and `xdotool` to check the window corners and autosave with a temporary notebook:
 
 ```sh
 cargo build --locked
