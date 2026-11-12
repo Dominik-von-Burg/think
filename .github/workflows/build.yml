@@ -54,7 +54,7 @@ jobs:
 
       - name: Install system dependencies
         if: matrix.name == 'linux-x86_64'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev xvfb xauth xdotool
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev xvfb xauth xdotool x11-utils openbox
 
       - name: Run tests
         run: cargo test --locked --target ${{ matrix.target }}

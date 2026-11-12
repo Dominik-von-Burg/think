@@ -4,10 +4,15 @@ set -euo pipefail
 binary=${1:?Usage: bash tests/linux-desktop.sh PATH_TO_THINK}
 data_dir=$(mktemp -d)
 pid=
+wm_pid=
 cleanup() {
     if [[ -n "$pid" ]]; then
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
+    fi
+    if [[ -n "$wm_pid" ]]; then
+        kill "$wm_pid" 2>/dev/null || true
+        wait "$wm_pid" 2>/dev/null || true
     fi
     rm -rf -- "$data_dir"
 }
@@ -15,7 +20,7 @@ trap cleanup EXIT
 
 fail() {
     printf '%s\n' "$1" >&2
-    cat "$data_dir/think.log" >&2
+    cat "$data_dir/openbox.log" "$data_dir/think.log" >&2 2>/dev/null || true
     exit 1
 }
 
@@ -23,6 +28,17 @@ notebook="$data_dir/think/notebook.txt"
 mkdir -p "$data_dir/think"
 printf 'Existing note' > "$notebook"
 printf 'Existing note\nWritten on Linux' > "$data_dir/expected.txt"
+
+XDG_CONFIG_HOME="$data_dir" openbox --sm-disable > "$data_dir/openbox.log" 2>&1 &
+wm_pid=$!
+for ((attempt = 0; attempt < 50; attempt++)); do
+    if xprop -root _NET_SUPPORTING_WM_CHECK | grep -q 'window id #'; then
+        break
+    fi
+    sleep 0.1
+done
+xprop -root _NET_SUPPORTING_WM_CHECK | grep -q 'window id #' \
+    || fail 'Openbox did not start.'
 
 env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
     XDG_DATA_HOME="$data_dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$data_dir/no-session-bus" \
@@ -32,8 +48,14 @@ pid=$!
 window=$(timeout 15s xdotool search --sync --onlyvisible --all --pid "$pid" --name '^Think$') \
     || fail 'Think did not open its notebook window.'
 
-# Click below the title bar, then append to the notebook with real X11 input.
-timeout 5s xdotool windowfocus --sync "$window" mousemove --window "$window" 70 65 click 1 \
+# Openbox reports the size of the frame it added around the app. The top
+# extent is positive when the native title bar is present.
+timeout 5s xdotool windowactivate --sync "$window" || fail 'Could not activate the Think window.'
+frame_top=$(xprop -id "$window" -notype _NET_FRAME_EXTENTS | awk -F ', *' 'NF == 4 {print $3}')
+[[ "$frame_top" =~ ^[1-9][0-9]*$ ]] || fail 'Think did not receive a native title bar.'
+
+# Click below the notebook toolbar and append with real X11 input.
+xdotool mousemove --window "$window" 70 65 click 1 \
     || fail 'Could not focus the Think editor.'
 xdotool key ctrl+End Return
 xdotool type 'Written on Linux'
@@ -49,29 +71,15 @@ if ! cmp -s "$data_dir/expected.txt" "$notebook"; then
     fail 'Think did not autosave the edited notebook.'
 fi
 
-geometry=$(xdotool getwindowgeometry --shell "$window")
-width=$(sed -n 's/^WIDTH=//p' <<<"$geometry")
-height=$(sed -n 's/^HEIGHT=//p' <<<"$geometry")
-
-# X11 excludes the rounded corners from the window's input region.
-for x in 0 "$((width - 1))"; do
-    for y in 0 "$((height - 1))"; do
-        location=$(xdotool mousemove --window "$window" "$x" "$y" getmouselocation --shell)
-        if [[ $(sed -n 's/^WINDOW=//p' <<<"$location") == "$window" ]]; then
-            fail "Think's window still covers corner ($x, $y)."
-        fi
-    done
-done
-
-# At 1x scale the close button is centered 23 px from the right edge.
-xdotool mousemove --window "$window" "$((width - 23))" 16 click 1
+# Ask the window manager to close the app through its normal close action.
+xdotool key alt+F4
 for ((attempt = 0; attempt < 100; attempt++)); do
     if ! kill -0 "$pid" 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
-kill -0 "$pid" 2>/dev/null && fail 'Think did not close from its title bar.'
+kill -0 "$pid" 2>/dev/null && fail 'Think did not close on the window manager request.'
 wait "$pid" || fail 'Think exited with an error.'
 pid=
-printf 'Think opened with rounded corners, autosaved the edited notebook, and closed from its title bar.\n'
+printf 'Think opened with a native title bar, autosaved the edited notebook, and closed on request.\n'

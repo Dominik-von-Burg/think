@@ -11,8 +11,6 @@
 mod app;
 mod fonts;
 mod keyring_store;
-#[cfg(target_os = "linux")]
-mod linux_window;
 mod markdown;
 mod mcp;
 mod paths;
@@ -128,8 +126,7 @@ pub(crate) fn main() {
         .with_inner_size([900.0, 650.0])
         .with_min_inner_size([400.0, 300.0])
         .with_icon(app_icon())
-        .with_decorations(cfg!(target_os = "macos"))
-        .with_transparent(cfg!(target_os = "linux"));
+        .with_decorations(!cfg!(target_os = "windows"));
 
     if let Err(e) = eframe::run_native(
         APP_NAME,

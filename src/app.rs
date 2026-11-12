@@ -18,10 +18,10 @@ use crate::scroll::*;
 use crate::sync::commit_and_push;
 use crate::title_bar::*;
 use crate::trace::scroll_log;
-use crate::{configure_context, set_windows_title_bar_colors, APP_NAME};
+use crate::{configure_context, set_windows_title_bar_colors};
 
 #[cfg(target_os = "windows")]
-use crate::win_chrome;
+use crate::{win_chrome, APP_NAME};
 
 pub(crate) const DEBOUNCE: Duration = Duration::from_secs(3);
 
@@ -52,8 +52,6 @@ pub(crate) struct NotebookApp {
     /// The last pass moved the view and asked egui to paint the frame again: trace
     /// the pass that replaces it, which is the one on screen.
     trace_repaint: bool,
-    #[cfg(target_os = "linux")]
-    window_corners: crate::linux_window::WindowCorners,
 }
 
 impl NotebookApp {
@@ -65,6 +63,10 @@ impl NotebookApp {
         let paths = Paths::new();
         let settings = load_settings(&paths.settings);
         let text = fs::read_to_string(&paths.notebook).unwrap_or_default();
+        Self::with(paths, settings, text)
+    }
+
+    fn with(paths: Paths, settings: Settings, text: String) -> Self {
         let token_input = crate::keyring_store::load_token().unwrap_or_default();
         Self {
             text,
@@ -81,8 +83,6 @@ impl NotebookApp {
             fade_top: 0.0,
             fade_bottom: 0.0,
             trace_repaint: false,
-            #[cfg(target_os = "linux")]
-            window_corners: crate::linux_window::WindowCorners::new(cc),
         }
     }
 
@@ -163,6 +163,31 @@ impl NotebookApp {
         }
     }
 
+    fn show_sync_controls(&mut self, ui: &mut egui::Ui) -> bool {
+        let settings =
+            title_bar_icon_button(ui, TitleBarIcon::Settings).on_hover_text("GitHub settings");
+        if settings.clicked() {
+            self.show_settings = true;
+        }
+        self.sync_status(ui);
+        settings.hovered()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn show_notebook_toolbar(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("notebook_toolbar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-4.0, 2.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(screen.width() - 8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.show_sync_controls(ui);
+                });
+            });
+    }
+
+    #[cfg(target_os = "windows")]
     fn show_title_bar(&mut self, ctx: &egui::Context) {
         // Custom caption with native-style window buttons: 46px wide, flush
         // with the top-right corner, subtle hover fill (red for close) and
@@ -223,9 +248,6 @@ impl NotebookApp {
                 // On Windows the maximize button is hit-tested natively
                 // (HTMAXBUTTON) for Snap Layouts: the wndproc handles the
                 // click and Windows shows the flyout instead of a tooltip.
-                #[cfg(not(target_os = "windows"))]
-                let maximize =
-                    maximize.on_hover_text(if maximized { "Restore" } else { "Maximize" });
                 control_hovered |= maximize.hovered();
                 if maximize.clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
@@ -250,27 +272,17 @@ impl NotebookApp {
                                 .size(14.0),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let settings = title_bar_icon_button(ui, TitleBarIcon::Settings)
-                                .on_hover_text("GitHub settings");
-                            control_hovered |= settings.hovered();
-                            if settings.clicked() {
-                                self.show_settings = true;
-                            }
-
-                            self.sync_status(ui);
+                            control_hovered |= self.show_sync_controls(ui);
                         });
                     });
                 });
 
                 // Publish hit-test metrics for the Win32 subclass (physical px).
-                #[cfg(target_os = "windows")]
-                {
-                    let ppp = ctx.pixels_per_point();
-                    win_chrome::set_hit_metrics(
-                        (TITLE_BAR_HEIGHT * ppp).round() as u32,
-                        (CAPTION_BUTTON_WIDTH * ppp).round() as u32,
-                    );
-                }
+                let ppp = ctx.pixels_per_point();
+                win_chrome::set_hit_metrics(
+                    (TITLE_BAR_HEIGHT * ppp).round() as u32,
+                    (CAPTION_BUTTON_WIDTH * ppp).round() as u32,
+                );
 
                 let (pointer_in_title_bar, primary_pressed, double_clicked) = ctx.input(|input| {
                     (
@@ -296,13 +308,9 @@ impl NotebookApp {
             });
     }
 
-    /// Fallback resize drag for platforms without native HT* hit-testing.
-    /// On Windows the wndproc subclass handles resize natively; skip
-    /// BeginResize there so the two don't fight.
+    /// Fallback resize drag. Windows and Linux use their native resize borders.
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn handle_window_resize(&self, ctx: &egui::Context) {
-        if cfg!(target_os = "windows") {
-            return;
-        }
         const RESIZE_BORDER: f32 = 3.0;
         let direction = ctx.input(|input| {
             if !input.pointer.primary_pressed() || input.viewport().maximized == Some(true) {
@@ -333,6 +341,7 @@ impl NotebookApp {
 
     /// Set the resize cursor on hover. Must run last in `update`, after the
     /// TextEdit, or the I-beam overrides it.
+    #[cfg(not(target_os = "linux"))]
     fn update_resize_cursor(&self, ctx: &egui::Context) {
         const RESIZE_BORDER: f32 = 3.0;
         if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
@@ -386,9 +395,11 @@ impl NotebookApp {
     /// call it directly with an egui context of their own.
     fn draw(&mut self, ctx: &egui::Context) {
         self.collect_finished_sync();
-        if !cfg!(target_os = "macos") {
-            self.show_title_bar(ctx);
-        }
+        #[cfg(target_os = "windows")]
+        self.show_title_bar(ctx);
+        #[cfg(target_os = "linux")]
+        self.show_notebook_toolbar(ctx);
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         self.handle_window_resize(ctx);
 
         egui::CentralPanel::default()
@@ -683,6 +694,7 @@ impl NotebookApp {
             ctx.set_cursor_icon(egui::CursorIcon::Default);
         }
         // Last: overrides TextEdit's I-beam when hovering the resize border.
+        #[cfg(not(target_os = "linux"))]
         self.update_resize_cursor(ctx);
     }
 
@@ -778,8 +790,6 @@ impl NotebookApp {
 impl eframe::App for NotebookApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.draw(ctx);
-        #[cfg(target_os = "linux")]
-        self.window_corners.update(ctx);
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
@@ -825,8 +835,6 @@ mod harness {
             fade_top: 0.0,
             fade_bottom: 0.0,
             trace_repaint: false,
-            #[cfg(target_os = "linux")]
-            window_corners: Default::default(),
         }
     }
 

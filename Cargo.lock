@@ -3579,7 +3579,6 @@ dependencies = [
  "toml 0.8.23",
  "windows-sys 0.59.0",
  "winres",
- "x11rb",
 ]
 
 [[package]]
