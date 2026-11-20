@@ -414,8 +414,6 @@ impl NotebookApp {
                     ui.min_rect().min,
                     egui::vec2(screen.width(), TITLE_BAR_HEIGHT),
                 );
-                // No opaque fill: scrolled text fades out underneath the bar
-                // via the top scroll fade instead.
 
                 let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
                 let close_rect = egui::Rect::from_min_size(

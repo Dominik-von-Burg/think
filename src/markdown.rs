@@ -41,7 +41,7 @@ pub(crate) fn markdown_layouter(
                 0.0,
                 TextFormat {
                     font_id: font_id.clone(),
-                    line_height: Some(21.0),
+                    line_height: Some(20.0),
                     color: if link { link_color } else { base },
                     underline: if link {
                         egui::Stroke::new(1.0_f32, link_color)

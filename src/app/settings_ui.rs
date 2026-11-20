@@ -10,7 +10,6 @@ const ERROR: Color32 = Color32::from_rgb(236, 139, 132);
 const SUCCESS: Color32 = Color32::from_rgb(151, 198, 167);
 const ACCENT: Color32 = Color32::from_rgb(47, 77, 109);
 const BORDER: Color32 = Color32::from_rgb(63, 65, 74);
-const WINDOW_MARGIN: f32 = 22.0;
 
 impl NotebookApp {
     pub(super) fn draw_settings(&mut self, ctx: &egui::Context) {
@@ -29,7 +28,8 @@ impl NotebookApp {
             });
 
         let screen = ctx.screen_rect();
-        let width = (screen.width() - 2.0 * WINDOW_MARGIN - 24.0).clamp(1.0, 450.0);
+        let margin = (screen.height() * 0.04).clamp(12.0, 22.0);
+        let width = (screen.width() - 2.0 * margin - 24.0).clamp(1.0, 450.0);
         egui::Window::new("Settings")
             .title_bar(false)
             .movable(false)
@@ -45,7 +45,7 @@ impl NotebookApp {
                     .fill(Color32::from_rgb(28, 29, 33))
                     .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .rounding(egui::Rounding::same(14.0))
-                    .inner_margin(egui::Margin::same(WINDOW_MARGIN)),
+                    .inner_margin(egui::Margin::same(margin)),
             )
             .show(ctx, |ui| {
                 ui.set_width(width);
@@ -88,7 +88,7 @@ impl NotebookApp {
                 egui::ScrollArea::vertical()
                     .id_salt(scroll_id)
                     .max_height(
-                        (screen.height() - TITLE_BAR_HEIGHT - 2.0 * WINDOW_MARGIN - 112.0).max(1.0),
+                        (screen.height() - TITLE_BAR_HEIGHT - 2.0 * margin - 112.0).max(1.0),
                     )
                     .auto_shrink([false, true])
                     .show(ui, |ui| match dialog.page {
@@ -113,44 +113,38 @@ impl NotebookApp {
         if dialog.replacement.is_some() && dialog.replacement != conflict {
             dialog.replacement = None;
         }
-        card(ui, |ui| {
-            let (title, color, description) = if self.sync_in_progress {
-                ("Syncing", MUTED, "Sending your notebook to GitHub.")
-            } else if self.sync_error.is_some() {
-                ("Sync failed", ERROR, "")
-            } else if !self.sync_configured() {
-                (
-                    "Not configured",
-                    MUTED,
-                    "Add a repository and token to enable GitHub sync.",
-                )
-            } else if self.last_change.is_some() {
-                (
-                    "Waiting to sync",
-                    MUTED,
-                    "Think will sync after you pause typing.",
-                )
-            } else if self.synced {
-                ("Synced", SUCCESS, "Your latest sync completed.")
-            } else {
-                (
-                    "Ready to sync",
-                    SUCCESS,
-                    "Think will sync the next time you edit the notebook.",
-                )
-            };
-            ui.label(RichText::new(title).color(color).strong());
-            if !description.is_empty() {
-                ui.label(RichText::new(description).color(MUTED).size(13.0));
-            }
-            if let Some(error) = &self.sync_error {
-                ui.add(
-                    egui::Label::new(RichText::new(error.to_string()).size(13.0))
-                        .wrap()
-                        .selectable(true),
-                );
-            }
-            if self.sync_configured() || self.sync_error.is_some() {
+        if self.sync_configured() || self.sync_error.is_some() || self.sync_in_progress {
+            card(ui, |ui| {
+                let (title, color, description) = if self.sync_in_progress {
+                    ("Syncing", MUTED, "Sending your notebook to GitHub.")
+                } else if self.sync_error.is_some() {
+                    ("Sync failed", ERROR, "")
+                } else if self.last_change.is_some() {
+                    (
+                        "Waiting to sync",
+                        MUTED,
+                        "Think will sync after you pause typing.",
+                    )
+                } else if self.synced {
+                    ("Synced", SUCCESS, "Your latest sync completed.")
+                } else {
+                    (
+                        "Ready to sync",
+                        SUCCESS,
+                        "Think will sync the next time you edit the notebook.",
+                    )
+                };
+                ui.label(RichText::new(title).color(color).strong());
+                if !description.is_empty() {
+                    ui.label(RichText::new(description).color(MUTED).size(13.0));
+                }
+                if let Some(error) = &self.sync_error {
+                    ui.add(
+                        egui::Label::new(RichText::new(error.to_string()).size(13.0))
+                            .wrap()
+                            .selectable(true),
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
                     let action = if self.sync_error.is_some() {
                         "Retry sync"
@@ -169,31 +163,31 @@ impl NotebookApp {
                         }
                     }
                 });
-            }
-            if let Some(remote) = &conflict {
-                ui.hyperlink_to("Open GitHub repository", &remote.repository_url);
-                if dialog.replacement.is_some() {
-                    ui.label("Upload the current local text? This will replace the GitHub version shown in this conflict.");
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(can_sync, egui::Button::new("Confirm upload"))
-                            .clicked()
-                        {
-                            self.sync_now(dialog.replacement.take());
-                        }
-                        if ui.button("Cancel").clicked() {
-                            dialog.replacement = None;
-                        }
-                    });
-                } else if ui
-                    .add_enabled(can_sync, egui::Button::new("Use local version"))
-                    .clicked()
-                {
-                    dialog.replacement = Some(remote.clone());
+                if let Some(remote) = &conflict {
+                    ui.hyperlink_to("Open GitHub repository", &remote.repository_url);
+                    if dialog.replacement.is_some() {
+                        ui.label("Upload the current local text? This will replace the GitHub version shown in this conflict.");
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(can_sync, egui::Button::new("Confirm upload"))
+                                .clicked()
+                            {
+                                self.sync_now(dialog.replacement.take());
+                            }
+                            if ui.button("Cancel").clicked() {
+                                dialog.replacement = None;
+                            }
+                        });
+                    } else if ui
+                        .add_enabled(can_sync, egui::Button::new("Use local version"))
+                        .clicked()
+                    {
+                        dialog.replacement = Some(remote.clone());
+                    }
                 }
-            }
-        });
-        ui.add_space(8.0);
+            });
+            ui.add_space(8.0);
+        }
         ui.label(RichText::new("Repository URL").strong());
         let url = ui
             .add(field(&mut dialog.repo_url).hint_text("https://github.com/you/private-notebook"));

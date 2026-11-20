@@ -288,11 +288,19 @@ pub(crate) fn paint_scroll_fades(painter: &egui::Painter, rect: egui::Rect, top:
         return;
     }
 
+    // Keep glyphs off the caption controls even while the fade is easing or
+    // suppressed for a nearby caret. Soften the transition below the controls.
+    let mask_bottom = rect.top() + (TITLE_BAR_HEIGHT - 6.0).min(top_height);
+    painter.rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), mask_bottom)),
+        0.0,
+        Color32::from_gray(22),
+    );
     if top > 0.001 {
         paint_fade(
             painter,
             egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top()),
+                egui::pos2(rect.left(), mask_bottom),
                 egui::pos2(rect.right(), rect.top() + top_height),
             ),
             true,
