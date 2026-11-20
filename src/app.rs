@@ -483,7 +483,6 @@ impl NotebookApp {
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         egui::Frame::none()
-                            .fill(Color32::from_gray(22))
                             .inner_margin(egui::Margin {
                                 right: 5.0,
                                 ..Default::default()
