@@ -765,7 +765,7 @@ impl NotebookApp {
                             scroll_output.content_size.y,
                             pass.pen,
                             pass.pad,
-                            pass.text_height,
+                            pass.galley.rect.height(),
                             pass.view_bottom,
                             caret_bottom,
                             pass.view_bottom - caret_bottom,
@@ -778,7 +778,6 @@ impl NotebookApp {
                 self.trace_repaint = redo && !self.trace_repaint;
                 let offset = scroll_output.state.offset.y;
                 let caret = pass.caret_row.unwrap_or(egui::Rect::NOTHING);
-                let text_height = pass.text_height;
                 let changed = pass.response.changed();
                 let top_target = top_fade_intensity(offset, viewport, caret);
                 let bottom_target =
@@ -807,8 +806,8 @@ impl NotebookApp {
                     &mut scroll_output.state,
                     scroll_output.content_size.y,
                     scroll_output.inner_rect.height(),
-                    text_height,
-                    &self.text,
+                    &pass.galley,
+                    pass.text_top,
                 ) {
                     scroll_output.state.store(ui.ctx(), scroll_output.id);
                 }
@@ -979,7 +978,8 @@ impl NotebookApp {
             view_top,
             view_bottom,
             text_bottom,
-            text_height: output.galley.rect.height(),
+            galley: output.galley,
+            text_top: output.galley_pos.y - content_top,
             caret_row,
             moved,
             pen,

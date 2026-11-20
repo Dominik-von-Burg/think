@@ -103,7 +103,8 @@ pub(crate) struct EditorPass {
     pub(crate) view_bottom: f32,
     /// Bottom of the text's last row.
     pub(crate) text_bottom: f32,
-    pub(crate) text_height: f32,
+    pub(crate) galley: std::sync::Arc<egui::Galley>,
+    pub(crate) text_top: f32,
     /// The whole row the caret is on, while the text edit has focus.
     pub(crate) caret_row: Option<egui::Rect>,
     /// A key went down or the text changed: the caret may have moved.
@@ -321,8 +322,8 @@ pub(crate) fn paint_custom_scrollbar(
     state: &mut egui::scroll_area::State,
     content_height: f32,
     viewport_height: f32,
-    text_height: f32,
-    text: &str,
+    galley: &egui::Galley,
+    text_top: f32,
 ) -> bool {
     // The bar is shorter than the scroll area's viewport (it starts below
     // the floating header), so map content coordinates onto the bar and let
@@ -381,13 +382,35 @@ pub(crate) fn paint_custom_scrollbar(
     }
 
     let painter = ui.painter();
-    let line_x = rect.left();
-    let thumb_width = if response.hovered() || response.dragged() {
-        8.0
-    } else {
-        5.0
-    };
-    let center_x = rect.center().x;
+    // VSCode-style: no track background. A thin line on the left edge carries
+    // the header markers; the thumb is centered between the line and the
+    // window's right edge.
+    let line_x = rect.left() + 0.5;
+    let line_color = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(line_x, rect.top()),
+            egui::pos2(line_x + 1.0, rect.bottom()),
+        ),
+        0.0,
+        line_color,
+    );
+    // Top edge: closes the scrollbar container, from the line all the way to
+    // the window's right edge. Same style as the window's right border.
+    let window_right = ui.ctx().screen_rect().right();
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(line_x, rect.top()),
+            egui::pos2(window_right, rect.top() + 1.0),
+        ),
+        0.0,
+        Color32::from_rgb(54, 54, 54),
+    );
+
+    // Thumb: centered between the line and the window's right edge, shifted
+    // 2px right.
+    let thumb_width = 12.0;
+    let center_x = (line_x + 0.5 + rect.right()) / 2.0 + 2.0;
     let thumb = egui::Rect::from_center_size(
         egui::pos2(center_x, thumb_rect.center().y),
         egui::vec2(thumb_width, thumb_rect.height()),
@@ -401,31 +424,21 @@ pub(crate) fn paint_custom_scrollbar(
     };
     painter.rect_filled(thumb, 3.0, thumb_color);
 
-    // Header markers: one per markdown header, always visible on the line.
-    let line_count = text.lines().count();
-    if line_count > 0 && content_height > TITLE_BAR_HEIGHT + 8.0 {
-        // The text is one uniform line height per line, so the line height
-        // falls out of the text's measured height. Not the content's: the
-        // space under the text grows to hold the view still.
-        let line_height = text_height / line_count as f32;
-        let mark = Color32::from_rgba_unmultiplied(140, 180, 232, 110);
-        for (i, line) in text.lines().enumerate() {
-            if !is_markdown_header(line) {
-                continue;
-            }
-            let y = rect.top() + (TITLE_BAR_HEIGHT + 8.0 + (i as f32 + 0.5) * line_height) * scale;
-            if !(rect.top()..=rect.bottom()).contains(&y) {
-                continue;
-            }
+    // Wrapped rows occupy real document height. Place each heading at its
+    // first rendered row, using the same content coordinates as the thumb.
+    let mut lines = galley.text().lines();
+    let mut starts_line = true;
+    let mark = Color32::from_rgba_unmultiplied(140, 180, 232, 110);
+    for row in &galley.rows {
+        if starts_line && lines.next().is_some_and(is_markdown_header) {
+            let y = rect.top() + (text_top + row.rect.center().y) * scale;
             painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(line_x + 4.0, y - 0.5),
-                    egui::pos2(rect.right() + 1.0, y + 0.5),
-                ),
+                egui::Rect::from_center_size(egui::pos2(center_x, y), egui::vec2(thumb_width, 1.0)),
                 0.0,
                 mark,
             );
         }
+        starts_line = row.ends_with_newline;
     }
 
     changed
