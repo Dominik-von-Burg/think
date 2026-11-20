@@ -23,7 +23,7 @@ pub(crate) const SCROLL_FADE_HEIGHT: f32 = 24.0;
 /// band has to hide text running under the floating title, so it is stronger.
 pub(crate) const FADE_BOTTOM_ALPHA: f32 = 0.55;
 
-pub(crate) const FADE_TOP_ALPHA: f32 = 0.85;
+pub(crate) const FADE_TOP_ALPHA: f32 = 1.0;
 
 /// Scroll distance over which a fade eases in or out, so no band ever switches
 /// on at full strength.
@@ -103,7 +103,8 @@ pub(crate) struct EditorPass {
     pub(crate) view_bottom: f32,
     /// Bottom of the text's last row.
     pub(crate) text_bottom: f32,
-    pub(crate) text_height: f32,
+    pub(crate) galley: std::sync::Arc<egui::Galley>,
+    pub(crate) text_top: f32,
     /// The whole row the caret is on, while the text edit has focus.
     pub(crate) caret_row: Option<egui::Rect>,
     /// A key went down or the text changed: the caret may have moved.
@@ -154,7 +155,7 @@ pub(crate) fn paint_fade(
         if opaque_at_top {
             // Hold opacity longer so scrolled text can't show through
             // behind the title bar and caption buttons.
-            a = a.powf(0.6);
+            a = a.powf(0.45);
         }
         let a = (a * peak * intensity).clamp(0.0, 1.0);
         let c = Color32::from_rgba_unmultiplied(22, 22, 22, (a * 255.0 + 0.5) as u8);
@@ -281,7 +282,7 @@ pub(crate) fn caret_in_band(
 /// `peak` is the opacity the band reaches at the window's edge.
 pub(crate) fn paint_scroll_fades(painter: &egui::Painter, rect: egui::Rect, top: f32, bottom: f32) {
     // The top fade covers the whole floating title zone (bar + spacing)
-    // so scrolled text is fully masked behind the title and buttons.
+    // so lines recede continuously as they pass behind the controls.
     let top_height = top_fade_height(rect);
     let height = bottom_fade_height(rect);
     if top_height <= 0.0 {
@@ -291,10 +292,7 @@ pub(crate) fn paint_scroll_fades(painter: &egui::Painter, rect: egui::Rect, top:
     if top > 0.001 {
         paint_fade(
             painter,
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top()),
-                egui::pos2(rect.right(), rect.top() + top_height),
-            ),
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + top_height)),
             true,
             FADE_TOP_ALPHA,
             top,
@@ -324,8 +322,8 @@ pub(crate) fn paint_custom_scrollbar(
     state: &mut egui::scroll_area::State,
     content_height: f32,
     viewport_height: f32,
-    text_height: f32,
-    text: &str,
+    galley: &egui::Galley,
+    text_top: f32,
 ) -> bool {
     // The bar is shorter than the scroll area's viewport (it starts below
     // the floating header), so map content coordinates onto the bar and let
@@ -333,6 +331,9 @@ pub(crate) fn paint_custom_scrollbar(
     // area's own max offset keeps the thumb from snapping back at the ends.
     let bar_height = rect.height();
     let max_offset = (content_height - viewport_height).max(0.0);
+    if max_offset <= 0.5 || bar_height <= 0.0 {
+        return false;
+    }
     let offset = state.offset.y.clamp(0.0, max_offset);
     let scale = if content_height > 0.0 {
         bar_height / content_height
@@ -340,13 +341,10 @@ pub(crate) fn paint_custom_scrollbar(
         0.0
     };
 
-    let thumb_height = if max_offset <= 0.0 {
-        bar_height
-    } else {
-        (viewport_height * scale).min(bar_height).max(32.0)
-    };
+    let thumb_height = (viewport_height * scale).max(32.0).min(bar_height);
+    let thumb_scale = (bar_height - thumb_height) / max_offset;
     let thumb_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), rect.top() + offset * scale),
+        egui::pos2(rect.left(), rect.top() + offset * thumb_scale),
         egui::vec2(rect.width(), thumb_height),
     );
 
@@ -358,15 +356,15 @@ pub(crate) fn paint_custom_scrollbar(
     let mut changed = false;
     let mut new_offset = offset;
     if response.dragged() {
-        if scale > 0.0 {
-            new_offset = (offset + response.drag_delta().y / scale).clamp(0.0, max_offset);
+        if thumb_scale > 0.0 {
+            new_offset = (offset + response.drag_delta().y / thumb_scale).clamp(0.0, max_offset);
         }
     } else if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if scale > 0.0 {
+            if thumb_scale > 0.0 {
                 // Center the thumb on the click.
-                new_offset =
-                    ((pos.y - rect.top()) / scale - viewport_height / 2.0).clamp(0.0, max_offset);
+                new_offset = ((pos.y - rect.top() - thumb_height / 2.0) / thumb_scale)
+                    .clamp(0.0, max_offset);
             }
         }
     } else if response.hovered() {
@@ -374,7 +372,7 @@ pub(crate) fn paint_custom_scrollbar(
         // not consumed by the scroll area itself.
         let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
-            new_offset = (offset + scroll).clamp(0.0, max_offset);
+            new_offset = (offset - scroll).clamp(0.0, max_offset);
         }
     }
     if (new_offset - offset).abs() > 0.01 {
@@ -426,31 +424,21 @@ pub(crate) fn paint_custom_scrollbar(
     };
     painter.rect_filled(thumb, 3.0, thumb_color);
 
-    // Header markers: one per markdown header, always visible on the line.
-    let line_count = text.lines().count();
-    if line_count > 0 && content_height > TITLE_BAR_HEIGHT + 8.0 {
-        // The text is one uniform line height per line, so the line height
-        // falls out of the text's measured height. Not the content's: the
-        // space under the text grows to hold the view still.
-        let line_height = text_height / line_count as f32;
-        let mark = Color32::from_rgba_unmultiplied(140, 180, 232, 110);
-        for (i, line) in text.lines().enumerate() {
-            if !is_markdown_header(line) {
-                continue;
-            }
-            let y = rect.top() + (TITLE_BAR_HEIGHT + 8.0 + (i as f32 + 0.5) * line_height) * scale;
-            if !(rect.top()..=rect.bottom()).contains(&y) {
-                continue;
-            }
+    // Wrapped rows occupy real document height. Place each heading at its
+    // first rendered row, using the same content coordinates as the thumb.
+    let mut lines = galley.text().lines();
+    let mut starts_line = true;
+    let mark = Color32::from_rgba_unmultiplied(140, 180, 232, 110);
+    for row in &galley.rows {
+        if starts_line && lines.next().is_some_and(is_markdown_header) {
+            let y = rect.top() + (text_top + row.rect.center().y) * scale;
             painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(line_x + 4.0, y - 0.5),
-                    egui::pos2(rect.right() + 1.0, y + 0.5),
-                ),
+                egui::Rect::from_center_size(egui::pos2(center_x, y), egui::vec2(thumb_width, 1.0)),
                 0.0,
                 mark,
             );
         }
+        starts_line = row.ends_with_newline;
     }
 
     changed
