@@ -30,6 +30,8 @@ use crate::win_chrome;
 pub(crate) const DEBOUNCE: Duration = Duration::from_secs(3);
 
 pub(crate) const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+const SETTINGS_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
 const MCP_HIGHLIGHT_SECONDS: f64 = 5.0;
 const MCP_HIGHLIGHT_FADE_SECONDS: f64 = 0.4;
 
@@ -371,10 +373,9 @@ impl NotebookApp {
             .on_hover_text("Open sync details")
         } else if !self.sync_configured() {
             ui.add(
-                egui::Button::new(egui::RichText::new("Not syncing").weak().size(12.0))
-                    .frame(false),
+                egui::Button::new(egui::RichText::new("Local only").weak().size(12.0)).frame(false),
             )
-            .on_hover_text("Open GitHub sync settings")
+            .on_hover_text("Set up GitHub sync")
         } else {
             return false;
         };
@@ -484,12 +485,15 @@ impl NotebookApp {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(APP_NAME)
-                                .color(Color32::from_rgb(232, 232, 232))
+                                .color(Color32::from_gray(184))
                                 .size(14.0),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let settings = title_bar_icon_button(ui, TitleBarIcon::Settings)
-                                .on_hover_text("Settings");
+                                .on_hover_text(format!(
+                                    "Settings ({})",
+                                    ctx.format_shortcut(&SETTINGS_SHORTCUT)
+                                ));
                             control_hovered |= settings.hovered();
                             if settings.clicked() {
                                 self.open_settings(SettingsPage::Sync);
@@ -631,6 +635,11 @@ impl NotebookApp {
     /// call it directly with an egui context of their own.
     fn draw(&mut self, ctx: &egui::Context) {
         self.collect_finished_sync();
+        if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS_SHORTCUT))
+            && self.settings_dialog.is_none()
+        {
+            self.open_settings(SettingsPage::Sync);
+        }
         if !cfg!(target_os = "macos") {
             self.show_title_bar(ctx);
         }
@@ -901,24 +910,36 @@ impl NotebookApp {
                     .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
             });
         let hovered_link = output.response.hover_pos().and_then(|pos| {
-            let idx = output
-                .galley
-                .cursor_from_pos(pos - output.galley_pos)
-                .ccursor
-                .index;
-            // Only count it when the pointer is actually over text.
-            output
-                .galley
-                .rect
-                .translate(output.galley_pos.to_vec2())
-                .contains(pos)
-                .then(|| link_at_char(&self.text, idx))
-                .flatten()
+            let local = pos - output.galley_pos;
+            let cursor = output.galley.cursor_from_pos(local);
+            let row = output.galley.rows.get(cursor.rcursor.row)?;
+            if !row.rect.contains(local.to_pos2()) {
+                return None;
+            }
+            // A caret snaps to the nearest boundary. A link belongs to the glyph
+            // under the pointer, including the right half of its final letter.
+            let column = row
+                .glyphs
+                .iter()
+                .position(|g| local.x < g.pos.x + g.size().x)?;
+            let index = cursor.ccursor.index - cursor.rcursor.column + column;
+            link_at_char(&self.text, index)
         });
         if let Some(url) = hovered_link {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            if output.response.clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            let modifier = if cfg!(target_os = "macos") {
+                "⌘"
+            } else {
+                "Ctrl"
+            };
+            output
+                .response
+                .clone()
+                .on_hover_text(format!("{modifier}+click to open link"));
+            if ui.input(|i| i.modifiers.command) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if output.response.clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
             }
         }
         EditorPass {

@@ -3,12 +3,14 @@ use eframe::egui::{self, Color32, RichText};
 use super::{NotebookApp, SettingsDialog, SettingsPage};
 use crate::mcp;
 use crate::sync::SyncError;
+use crate::title_bar::TITLE_BAR_HEIGHT;
 
 const MUTED: Color32 = Color32::from_rgb(164, 166, 174);
 const ERROR: Color32 = Color32::from_rgb(236, 139, 132);
 const SUCCESS: Color32 = Color32::from_rgb(151, 198, 167);
 const ACCENT: Color32 = Color32::from_rgb(47, 77, 109);
 const BORDER: Color32 = Color32::from_rgb(63, 65, 74);
+const WINDOW_MARGIN: f32 = 22.0;
 
 impl NotebookApp {
     pub(super) fn draw_settings(&mut self, ctx: &egui::Context) {
@@ -26,20 +28,24 @@ impl NotebookApp {
                 close |= ui.allocate_rect(screen, egui::Sense::click()).clicked();
             });
 
-        let width = (ctx.screen_rect().width() - 54.0).clamp(280.0, 450.0);
+        let screen = ctx.screen_rect();
+        let width = (screen.width() - 2.0 * WINDOW_MARGIN - 24.0).clamp(1.0, 450.0);
         egui::Window::new("Settings")
             .title_bar(false)
             .movable(false)
             .resizable(false)
             .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .anchor(
+                egui::Align2::CENTER_CENTER,
+                egui::vec2(0.0, TITLE_BAR_HEIGHT / 2.0),
+            )
             .default_width(width)
             .frame(
                 egui::Frame::none()
                     .fill(Color32::from_rgb(28, 29, 33))
                     .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .rounding(egui::Rounding::same(14.0))
-                    .inner_margin(egui::Margin::same(22.0)),
+                    .inner_margin(egui::Margin::same(WINDOW_MARGIN)),
             )
             .show(ctx, |ui| {
                 ui.set_width(width);
@@ -58,7 +64,7 @@ impl NotebookApp {
                             .clicked();
                     });
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for (page, title) in [
                         (SettingsPage::Sync, "GitHub sync"),
                         (SettingsPage::Mcp, "MCP access"),
@@ -75,9 +81,15 @@ impl NotebookApp {
                     }
                 });
                 ui.add_space(4.0);
+                let scroll_id = match dialog.page {
+                    SettingsPage::Sync => "sync_settings",
+                    SettingsPage::Mcp => "mcp_settings",
+                };
                 egui::ScrollArea::vertical()
-                    .id_salt("settings_content")
-                    .max_height((ctx.screen_rect().height() - 136.0).max(125.0))
+                    .id_salt(scroll_id)
+                    .max_height(
+                        (screen.height() - TITLE_BAR_HEIGHT - 2.0 * WINDOW_MARGIN - 112.0).max(1.0),
+                    )
                     .auto_shrink([false, true])
                     .show(ui, |ui| match dialog.page {
                         SettingsPage::Sync => self.show_sync_settings(ui, &mut dialog),
@@ -139,7 +151,7 @@ impl NotebookApp {
                 );
             }
             if self.sync_configured() || self.sync_error.is_some() {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let action = if self.sync_error.is_some() {
                         "Retry sync"
                     } else {
@@ -162,7 +174,7 @@ impl NotebookApp {
                 ui.hyperlink_to("Open GitHub repository", &remote.repository_url);
                 if dialog.replacement.is_some() {
                     ui.label("Upload the current local text? This will replace the GitHub version shown in this conflict.");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(can_sync, egui::Button::new("Confirm upload"))
                             .clicked()
@@ -205,7 +217,7 @@ impl NotebookApp {
             ui.colored_label(ERROR, error);
         }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_sized([112.0, 31.0], primary("Save settings"))
                 .clicked()
@@ -242,7 +254,7 @@ impl NotebookApp {
                     egui::Label::new(RichText::new(mcp::URL).monospace().size(12.0))
                         .selectable(true),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy URL").clicked() {
                         ui.ctx().copy_text(mcp::URL.to_owned());
                     }

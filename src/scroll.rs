@@ -333,6 +333,9 @@ pub(crate) fn paint_custom_scrollbar(
     // area's own max offset keeps the thumb from snapping back at the ends.
     let bar_height = rect.height();
     let max_offset = (content_height - viewport_height).max(0.0);
+    if max_offset <= 0.5 || bar_height <= 0.0 {
+        return false;
+    }
     let offset = state.offset.y.clamp(0.0, max_offset);
     let scale = if content_height > 0.0 {
         bar_height / content_height
@@ -340,13 +343,10 @@ pub(crate) fn paint_custom_scrollbar(
         0.0
     };
 
-    let thumb_height = if max_offset <= 0.0 {
-        bar_height
-    } else {
-        (viewport_height * scale).min(bar_height).max(32.0)
-    };
+    let thumb_height = (viewport_height * scale).max(32.0).min(bar_height);
+    let thumb_scale = (bar_height - thumb_height) / max_offset;
     let thumb_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), rect.top() + offset * scale),
+        egui::pos2(rect.left(), rect.top() + offset * thumb_scale),
         egui::vec2(rect.width(), thumb_height),
     );
 
@@ -358,15 +358,15 @@ pub(crate) fn paint_custom_scrollbar(
     let mut changed = false;
     let mut new_offset = offset;
     if response.dragged() {
-        if scale > 0.0 {
-            new_offset = (offset + response.drag_delta().y / scale).clamp(0.0, max_offset);
+        if thumb_scale > 0.0 {
+            new_offset = (offset + response.drag_delta().y / thumb_scale).clamp(0.0, max_offset);
         }
     } else if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if scale > 0.0 {
+            if thumb_scale > 0.0 {
                 // Center the thumb on the click.
-                new_offset =
-                    ((pos.y - rect.top()) / scale - viewport_height / 2.0).clamp(0.0, max_offset);
+                new_offset = ((pos.y - rect.top() - thumb_height / 2.0) / thumb_scale)
+                    .clamp(0.0, max_offset);
             }
         }
     } else if response.hovered() {
@@ -374,7 +374,7 @@ pub(crate) fn paint_custom_scrollbar(
         // not consumed by the scroll area itself.
         let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
-            new_offset = (offset + scroll).clamp(0.0, max_offset);
+            new_offset = (offset - scroll).clamp(0.0, max_offset);
         }
     }
     if (new_offset - offset).abs() > 0.01 {
@@ -384,35 +384,13 @@ pub(crate) fn paint_custom_scrollbar(
     }
 
     let painter = ui.painter();
-    // VSCode-style: no track background. A thin line on the left edge carries
-    // the header markers; the thumb is centered between the line and the
-    // window's right edge.
-    let line_x = rect.left() + 0.5;
-    let line_color = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(line_x, rect.top()),
-            egui::pos2(line_x + 1.0, rect.bottom()),
-        ),
-        0.0,
-        line_color,
-    );
-    // Top edge: closes the scrollbar container, from the line all the way to
-    // the window's right edge. Same style as the window's right border.
-    let window_right = ui.ctx().screen_rect().right();
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(line_x, rect.top()),
-            egui::pos2(window_right, rect.top() + 1.0),
-        ),
-        0.0,
-        Color32::from_rgb(54, 54, 54),
-    );
-
-    // Thumb: centered between the line and the window's right edge, shifted
-    // 2px right.
-    let thumb_width = 12.0;
-    let center_x = (line_x + 0.5 + rect.right()) / 2.0 + 2.0;
+    let line_x = rect.left();
+    let thumb_width = if response.hovered() || response.dragged() {
+        8.0
+    } else {
+        5.0
+    };
+    let center_x = rect.center().x;
     let thumb = egui::Rect::from_center_size(
         egui::pos2(center_x, thumb_rect.center().y),
         egui::vec2(thumb_width, thumb_rect.height()),
