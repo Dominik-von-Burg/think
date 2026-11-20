@@ -18,6 +18,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromRect, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::Controls::MARGINS;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
 };
@@ -29,6 +30,10 @@ static BTN_W_PX: AtomicU32 = AtomicU32::new(46);
 static MAX_HOVERED: AtomicBool = AtomicBool::new(false);
 static MAX_PRESSED: AtomicBool = AtomicBool::new(false);
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+static BOUNDS_CHECK_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Posted after display/DPI changes so winit finishes its own resize first.
+const WM_CHECK_WINDOW_BOUNDS: u32 = WM_APP + 0x2A;
 
 pub fn set_hit_metrics(caption_h_px: u32, btn_w_px: u32) {
     CAPTION_H_PX.store(caption_h_px.max(1), Ordering::Relaxed);
@@ -92,6 +97,106 @@ fn install(hwnd: HWND) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
         );
+    }
+}
+
+/// Minimum notebook size in physical pixels at the window's current DPI.
+/// The viewport builder uses logical points; Win32 geometry uses pixels.
+fn minimum_window_size(dpi: u32) -> (i32, i32) {
+    let scale = dpi.max(96) as f32 / 96.0;
+    (
+        (crate::MIN_WINDOW_SIZE[0] * scale).ceil() as i32,
+        (crate::MIN_WINDOW_SIZE[1] * scale).ceil() as i32,
+    )
+}
+
+/// Preserve the current dimensions and position whenever they still fit.
+/// Only shrink oversized windows, grow undersized ones, or move them on-screen.
+fn fit_window_to_work_area(window: RECT, work: RECT, minimum: (i32, i32)) -> RECT {
+    let available_width = (work.right - work.left).max(1);
+    let available_height = (work.bottom - work.top).max(1);
+    let width = (window.right - window.left)
+        .max(minimum.0)
+        .min(available_width);
+    let height = (window.bottom - window.top)
+        .max(minimum.1)
+        .min(available_height);
+    let left = window.left.clamp(work.left, work.right - width);
+    let top = window.top.clamp(work.top, work.bottom - height);
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
+unsafe fn window_geometry(hwnd: HWND) -> Option<(RECT, MONITORINFO)> {
+    let mut window: RECT = std::mem::zeroed();
+    if GetWindowRect(hwnd, &mut window) == 0 {
+        return None;
+    }
+    // A disconnected monitor is no longer returned by MonitorFromRect.
+    let monitor = MonitorFromRect(&window, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(monitor, &mut info) == 0 {
+        return None;
+    }
+    Some((window, info))
+}
+
+/// Display changes are not the only path here: Windows can resize a window
+/// during monitor removal without changing the remaining screen's resolution.
+unsafe fn needs_window_recovery(hwnd: HWND) -> bool {
+    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
+        return false;
+    }
+    let Some((window, info)) = window_geometry(hwnd) else {
+        return false;
+    };
+    let minimum = minimum_window_size(GetDpiForWindow(hwnd));
+    let too_small = window.right - window.left < minimum.0
+        || window.bottom - window.top < minimum.1;
+    let off_screen = window.right <= info.rcMonitor.left
+        || window.left >= info.rcMonitor.right
+        || window.bottom <= info.rcMonitor.top
+        || window.top >= info.rcMonitor.bottom;
+    too_small || off_screen
+}
+
+unsafe fn recover_window_bounds(hwnd: HWND) {
+    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
+        return;
+    }
+    let Some((window, info)) = window_geometry(hwnd) else {
+        return;
+    };
+    let minimum = minimum_window_size(GetDpiForWindow(hwnd));
+    let fitted = fit_window_to_work_area(window, info.rcWork, minimum);
+    if fitted.left != window.left
+        || fitted.top != window.top
+        || fitted.right != window.right
+        || fitted.bottom != window.bottom
+    {
+        // Do not activate or reorder Think just because the monitor changed.
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            fitted.left,
+            fitted.top,
+            fitted.right - fitted.left,
+            fitted.bottom - fitted.top,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+}
+
+unsafe fn request_bounds_check(hwnd: HWND) {
+    if !BOUNDS_CHECK_PENDING.swap(true, Ordering::Relaxed)
+        && PostMessageW(hwnd, WM_CHECK_WINDOW_BOUNDS, 0, 0) == 0
+    {
+        BOUNDS_CHECK_PENDING.store(false, Ordering::Relaxed);
     }
 }
 
@@ -169,6 +274,11 @@ unsafe extern "system" fn chrome_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_CHECK_WINDOW_BOUNDS => {
+            BOUNDS_CHECK_PENDING.store(false, Ordering::Relaxed);
+            recover_window_bounds(hwnd);
+            return 0;
+        }
         // Suppress the native caption (we paint our own) while keeping
         // the DWM shadow and rounded corners. A maximized window hangs
         // past the monitor edge by the frame thickness; clamp the client
@@ -225,11 +335,91 @@ unsafe extern "system" fn chrome_wnd_proc(
     }
 
     let prev = ORIG_PROC.load(Ordering::Relaxed);
-    if prev != 0 {
+    let result = if prev != 0 {
         // SAFETY: stored from SetWindowLongPtrW; winit's proc outlives us.
         let prev: WNDPROC = unsafe { std::mem::transmute::<isize, WNDPROC>(prev) };
         CallWindowProcW(prev, hwnd, msg, wparam, lparam)
     } else {
         DefWindowProcW(hwnd, msg, wparam, lparam)
+    };
+
+    // Let winit handle the native message before checking the resulting size.
+    // WM_WINDOWPOSCHANGED also covers unplug events without WM_DISPLAYCHANGE.
+    if msg == WM_DISPLAYCHANGE
+        || msg == WM_DPICHANGED
+        || (msg == WM_WINDOWPOSCHANGED && needs_window_recovery(hwnd))
+    {
+        request_bounds_check(hwnd);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    fn edges(rect: RECT) -> (i32, i32, i32, i32) {
+        (rect.left, rect.top, rect.right, rect.bottom)
+    }
+
+    #[test]
+    fn healthy_window_is_left_unchanged() {
+        let current = rect(30, 40, 830, 640);
+        assert_eq!(
+            edges(fit_window_to_work_area(current, rect(0, 0, 1366, 768), (400, 300))),
+            edges(current),
+        );
+    }
+
+    #[test]
+    fn a_tiny_window_grows_to_the_minimum() {
+        assert_eq!(
+            edges(fit_window_to_work_area(
+                rect(20, 20, 70, 65),
+                rect(0, 0, 1366, 768),
+                (400, 300)
+            )),
+            (20, 20, 420, 320),
+        );
+    }
+
+    #[test]
+    fn unplugged_external_monitor_moves_window_into_laptop_screen() {
+        assert_eq!(
+            edges(fit_window_to_work_area(
+                rect(-2000, 100, -1100, 750),
+                rect(0, 0, 1366, 768),
+                (400, 300)
+            )),
+            (0, 100, 900, 750),
+        );
+    }
+
+    #[test]
+    fn oversized_window_fits_a_smaller_laptop_screen() {
+        assert_eq!(
+            edges(fit_window_to_work_area(
+                rect(0, 0, 1920, 1080),
+                rect(0, 0, 1366, 768),
+                (400, 300)
+            )),
+            (0, 0, 1366, 768),
+        );
+    }
+
+    #[test]
+    fn small_work_area_does_not_push_window_outside_the_screen() {
+        assert_eq!(
+            edges(fit_window_to_work_area(
+                rect(0, 0, 40, 50),
+                rect(0, 0, 320, 240),
+                (400, 300)
+            )),
+            (0, 0, 320, 240),
+        );
     }
 }

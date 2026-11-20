@@ -35,6 +35,7 @@ use crate::app::NotebookApp;
 use crate::fonts::install_fonts;
 
 pub(crate) const APP_NAME: &str = "Think";
+pub(crate) const MIN_WINDOW_SIZE: [f32; 2] = [400.0, 300.0];
 
 pub(crate) const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/think-icon.rgba");
 
@@ -124,7 +125,7 @@ pub(crate) fn main() {
 
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([900.0, 650.0])
-        .with_min_inner_size([400.0, 300.0])
+        .with_min_inner_size(MIN_WINDOW_SIZE)
         .with_icon(app_icon())
         .with_decorations(cfg!(target_os = "macos"))
         .with_transparent(cfg!(target_os = "linux"));
