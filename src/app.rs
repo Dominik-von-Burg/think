@@ -19,7 +19,7 @@ use crate::scroll::*;
 use crate::sync::{sync_notebook, RemoteVersion, SyncError};
 use crate::title_bar::*;
 use crate::trace::scroll_log;
-use crate::{configure_context, set_windows_title_bar_colors, APP_NAME};
+use crate::{configure_context, configure_windows_window, APP_NAME};
 use crate::{mcp, notebook};
 
 mod settings_ui;
@@ -94,7 +94,7 @@ struct McpEdit {
 impl NotebookApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> io::Result<Self> {
         configure_context(&cc.egui_ctx);
-        set_windows_title_bar_colors(cc);
+        configure_windows_window(cc);
         #[cfg(target_os = "windows")]
         win_chrome::install_from(cc);
         let paths = Paths::new();
