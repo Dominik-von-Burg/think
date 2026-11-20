@@ -438,6 +438,7 @@ impl NotebookApp {
                     egui::vec2(CAPTION_BUTTON_WIDTH, TITLE_BAR_HEIGHT),
                 );
 
+                let controls_background = ui.painter().add(egui::Shape::Noop);
                 let mut control_hovered = false;
                 let close = self
                     .caption_button(ui, close_rect, CaptionButton::Close)
@@ -481,11 +482,28 @@ impl NotebookApp {
                 );
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(APP_NAME)
-                                .color(Color32::from_gray(184))
-                                .size(14.0),
-                        );
+                        egui::Frame::none()
+                            .fill(Color32::from_gray(22))
+                            .inner_margin(egui::Margin {
+                                right: 5.0,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.add(
+                                        egui::Image::new(egui::include_image!(
+                                            "../assets/think-icon.svg"
+                                        ))
+                                        .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(APP_NAME)
+                                            .color(Color32::from_gray(184))
+                                            .size(14.0),
+                                    );
+                                });
+                            });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let settings = title_bar_icon_button(ui, TitleBarIcon::Settings)
                                 .on_hover_text(format!(
@@ -505,6 +523,20 @@ impl NotebookApp {
                                     self.undo_mcp_edit(ctx);
                                 }
                             }
+                            let controls = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    ui.min_rect().left() - 2.0,
+                                    title_bar_rect.center().y - 10.0,
+                                ),
+                                egui::pos2(
+                                    title_bar_rect.right(),
+                                    title_bar_rect.center().y + 10.0,
+                                ),
+                            );
+                            ui.painter().set(
+                                controls_background,
+                                egui::Shape::rect_filled(controls, 3.0, Color32::from_gray(22)),
+                            );
                         });
                     });
                 });

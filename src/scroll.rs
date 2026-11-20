@@ -23,7 +23,7 @@ pub(crate) const SCROLL_FADE_HEIGHT: f32 = 24.0;
 /// band has to hide text running under the floating title, so it is stronger.
 pub(crate) const FADE_BOTTOM_ALPHA: f32 = 0.55;
 
-pub(crate) const FADE_TOP_ALPHA: f32 = 0.85;
+pub(crate) const FADE_TOP_ALPHA: f32 = 1.0;
 
 /// Scroll distance over which a fade eases in or out, so no band ever switches
 /// on at full strength.
@@ -154,7 +154,7 @@ pub(crate) fn paint_fade(
         if opaque_at_top {
             // Hold opacity longer so scrolled text can't show through
             // behind the title bar and caption buttons.
-            a = a.powf(0.6);
+            a = a.powf(0.45);
         }
         let a = (a * peak * intensity).clamp(0.0, 1.0);
         let c = Color32::from_rgba_unmultiplied(22, 22, 22, (a * 255.0 + 0.5) as u8);
@@ -281,28 +281,17 @@ pub(crate) fn caret_in_band(
 /// `peak` is the opacity the band reaches at the window's edge.
 pub(crate) fn paint_scroll_fades(painter: &egui::Painter, rect: egui::Rect, top: f32, bottom: f32) {
     // The top fade covers the whole floating title zone (bar + spacing)
-    // so scrolled text is fully masked behind the title and buttons.
+    // so lines recede continuously as they pass behind the controls.
     let top_height = top_fade_height(rect);
     let height = bottom_fade_height(rect);
     if top_height <= 0.0 {
         return;
     }
 
-    // Keep glyphs off the caption controls even while the fade is easing or
-    // suppressed for a nearby caret. Soften the transition below the controls.
-    let mask_bottom = rect.top() + (TITLE_BAR_HEIGHT - 6.0).min(top_height);
-    painter.rect_filled(
-        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), mask_bottom)),
-        0.0,
-        Color32::from_gray(22),
-    );
     if top > 0.001 {
         paint_fade(
             painter,
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left(), mask_bottom),
-                egui::pos2(rect.right(), rect.top() + top_height),
-            ),
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + top_height)),
             true,
             FADE_TOP_ALPHA,
             top,
