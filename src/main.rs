@@ -35,6 +35,7 @@ use crate::app::NotebookApp;
 use crate::fonts::install_fonts;
 
 pub(crate) const APP_NAME: &str = "Think";
+pub(crate) const MIN_WINDOW_SIZE: [f32; 2] = [400.0, 300.0];
 
 pub(crate) const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/think-icon.rgba");
 
@@ -64,9 +65,12 @@ pub(crate) fn configure_context(ctx: &egui::Context) {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn set_windows_title_bar_colors(cc: &eframe::CreationContext<'_>) {
+pub(crate) fn configure_windows_window(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, LoadIconW, SendMessageW, GWLP_HINSTANCE, ICON_BIG, WM_SETICON,
+    };
 
     let Ok(handle) = cc.window_handle() else {
         return;
@@ -74,6 +78,17 @@ pub(crate) fn set_windows_title_bar_colors(cc: &eframe::CreationContext<'_>) {
     let RawWindowHandle::Win32(window) = handle.as_raw() else {
         return;
     };
+
+    let hwnd = window.hwnd.get() as _;
+    // winit assigns the viewport icon to ICON_SMALL. Use the executable's
+    // shared icon resource (winres ID 1) for the taskbar and Alt+Tab.
+    unsafe {
+        let instance = GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) as _;
+        let icon = LoadIconW(instance, std::ptr::without_provenance(1));
+        if !icon.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as _, icon as _);
+        }
+    }
 
     // These Windows 10/11 DWM attributes color the native caption while keeping
     // normal resizing, snapping, and the system close/minimize/maximize buttons.
@@ -85,19 +100,19 @@ pub(crate) fn set_windows_title_bar_colors(cc: &eframe::CreationContext<'_>) {
     let text_color: u32 = 0x00E8_E8E8;
     unsafe {
         DwmSetWindowAttribute(
-            window.hwnd.get() as _,
+            hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &DWMWCP_ROUND as *const u32 as _,
             std::mem::size_of::<u32>() as u32,
         );
         DwmSetWindowAttribute(
-            window.hwnd.get() as _,
+            hwnd,
             DWMWA_CAPTION_COLOR,
             &caption_color as *const u32 as _,
             std::mem::size_of::<u32>() as u32,
         );
         DwmSetWindowAttribute(
-            window.hwnd.get() as _,
+            hwnd,
             DWMWA_TEXT_COLOR,
             &text_color as *const u32 as _,
             std::mem::size_of::<u32>() as u32,
@@ -106,7 +121,7 @@ pub(crate) fn set_windows_title_bar_colors(cc: &eframe::CreationContext<'_>) {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn set_windows_title_bar_colors(_: &eframe::CreationContext<'_>) {}
+pub(crate) fn configure_windows_window(_: &eframe::CreationContext<'_>) {}
 
 pub(crate) fn app_icon() -> egui::IconData {
     egui::IconData {
@@ -124,7 +139,7 @@ pub(crate) fn main() {
 
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([900.0, 650.0])
-        .with_min_inner_size([400.0, 300.0])
+        .with_min_inner_size(MIN_WINDOW_SIZE)
         .with_icon(app_icon())
         .with_decorations(cfg!(target_os = "macos"))
         .with_transparent(cfg!(target_os = "linux"));

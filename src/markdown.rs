@@ -16,7 +16,7 @@ pub(crate) fn markdown_layouter(
     highlight: Option<&(Range<usize>, Color32)>,
 ) -> Arc<egui::Galley> {
     let font_id = FontId::monospace(14.0);
-    let regular = ui.visuals().widgets.inactive.text_color();
+    let regular = Color32::from_rgb(204, 204, 204);
     let header_blue = Color32::from_rgb(140, 180, 232);
     let link_color = Color32::from_rgb(150, 166, 188);
 
@@ -41,6 +41,7 @@ pub(crate) fn markdown_layouter(
                 0.0,
                 TextFormat {
                     font_id: font_id.clone(),
+                    line_height: Some(20.0),
                     color: if link { link_color } else { base },
                     underline: if link {
                         egui::Stroke::new(1.0_f32, link_color)
@@ -111,11 +112,31 @@ pub(crate) fn find_links(text: &str) -> Vec<(usize, usize)> {
             from = start + 4;
             continue;
         }
-        let mut end = start
-            + rest
-                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
-                .unwrap_or(rest.len());
-        while end > start
+        let mut parentheses = 0usize;
+        let mut brackets = 0usize;
+        let mut last_matched_delimiter_end = start;
+        let mut end = text.len();
+        for (offset, ch) in rest.char_indices() {
+            if ch.is_whitespace() || matches!(ch, '<' | '>' | '"') {
+                end = start + offset;
+                break;
+            }
+            match ch {
+                '(' => parentheses += 1,
+                '[' => brackets += 1,
+                ')' if parentheses > 0 => {
+                    parentheses -= 1;
+                    last_matched_delimiter_end = start + offset + 1;
+                }
+                ']' if brackets > 0 => {
+                    brackets -= 1;
+                    last_matched_delimiter_end = start + offset + 1;
+                }
+                _ => {}
+            }
+        }
+        // Strip surrounding punctuation without removing a matched delimiter.
+        while end > last_matched_delimiter_end
             && matches!(
                 text.as_bytes()[end - 1],
                 b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'\''
@@ -153,6 +174,24 @@ pub(crate) fn is_markdown_header(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_keep_balanced_delimiters_and_internal_punctuation() {
+        let text =
+            "See (https://example.org/Écho_(one_(two))). http://[::1], https://example.org/?q=a,b!";
+        let links: Vec<_> = find_links(text)
+            .into_iter()
+            .map(|(start, end)| &text[start..end])
+            .collect();
+        assert_eq!(
+            links,
+            [
+                "https://example.org/Écho_(one_(two))",
+                "http://[::1]",
+                "https://example.org/?q=a,b",
+            ]
+        );
+    }
 
     #[test]
     fn markdown_headers_are_detected() {
